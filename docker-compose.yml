@@ -1,0 +1,57 @@
+# Brand Watchdog - Docker Compose (desenvolvimento local)
+# Uso: docker-compose up -d
+
+version: "3.9"
+
+services:
+  app:
+    build: .
+    container_name: brand-watchdog
+    restart: unless-stopped
+    environment:
+      - BRAND_WATCHDOG_STORAGE_DATABASE_URL=postgresql+asyncpg://watchdog:watchdog123@db:5432/brand_watchdog
+      - BRAND_WATCHDOG_ALERT_SES_SENDER=alerts@yourdomain.com
+      - BRAND_WATCHDOG_ALERT_RECIPIENTS=admin@yourdomain.com
+      - BRAND_WATCHDOG_SCHEDULE_INTERVAL_HOURS=24
+      - BRAND_WATCHDOG_ANALYZER_BEDROCK_REGION=us-east-1
+      - AWS_DEFAULT_REGION=us-east-1
+      # Credenciais AWS (usar perfil local ou IAM role em produção)
+      # - AWS_ACCESS_KEY_ID=
+      # - AWS_SECRET_ACCESS_KEY=
+    volumes:
+      - screenshots:/app/data/screenshots
+      - logos:/app/data/logos
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - watchdog-net
+
+  db:
+    image: postgres:16-alpine
+    container_name: brand-watchdog-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: watchdog
+      POSTGRES_PASSWORD: watchdog123
+      POSTGRES_DB: brand_watchdog
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U watchdog -d brand_watchdog"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - watchdog-net
+
+volumes:
+  pgdata:
+  screenshots:
+  logos:
+
+networks:
+  watchdog-net:
+    driver: bridge

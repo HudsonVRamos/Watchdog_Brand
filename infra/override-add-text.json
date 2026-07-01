@@ -1,0 +1,8 @@
+{
+  "containerOverrides": [
+    {
+      "name": "brand-watchdog",
+      "command": ["python", "-m", "brand_watchdog.cli", "add-text", "SKY"]
+    }
+  ]
+}

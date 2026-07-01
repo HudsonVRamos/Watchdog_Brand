@@ -1,0 +1,37 @@
+# Brand Watchdog - Configuração de Produção
+# Valores podem ser sobrescritos por variáveis de ambiente:
+# BRAND_WATCHDOG_<SECTION>_<FIELD>=valor
+
+crawler:
+  viewport_width: 1280
+  page_timeout_seconds: 60
+  network_idle_timeout_ms: 500
+  max_screenshot_height_px: 8000
+  screenshot_format: png
+
+analyzer:
+  bedrock_model_id: "us.anthropic.claude-sonnet-4-6"
+  bedrock_region: "us-east-1"
+  confidence_threshold: 70
+  request_timeout_seconds: 60
+  max_retries: 3
+  retry_base_delay_seconds: 2.0
+
+alert:
+  provider: "ses"
+  ses_region: "us-east-1"
+  ses_sender: ""  # Definir via env: BRAND_WATCHDOG_ALERT_SES_SENDER
+  recipients: []  # Definir via env: BRAND_WATCHDOG_ALERT_RECIPIENTS=a@x.com,b@x.com
+  retry_attempts: 3
+  retry_interval_seconds: 30
+
+schedule:
+  interval_hours: 24
+
+storage:
+  screenshot_retention_days: 90
+  detection_retention_days: 90
+  screenshot_base_path: "/app/data/screenshots"
+  database_url: ""  # Definir via env: BRAND_WATCHDOG_STORAGE_DATABASE_URL
+
+max_target_sites: 200

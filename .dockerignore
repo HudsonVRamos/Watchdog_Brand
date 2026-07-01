@@ -1,0 +1,17 @@
+.git
+.gitignore
+.hypothesis
+.pytest_cache
+.kiro
+__pycache__
+*.pyc
+*.pyo
+*.egg-info
+dist
+build
+tests
+.env
+.env.*
+*.md
+docker-compose*.yml
+infra/

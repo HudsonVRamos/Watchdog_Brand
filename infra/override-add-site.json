@@ -1,0 +1,8 @@
+{
+  "containerOverrides": [
+    {
+      "name": "brand-watchdog",
+      "command": ["python", "-m", "brand_watchdog.cli", "add-site", "https://www.skymais.com.br/home"]
+    }
+  ]
+}
