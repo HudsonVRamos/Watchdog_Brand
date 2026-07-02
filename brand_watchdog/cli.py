@@ -271,6 +271,14 @@ async def run_cycle() -> None:
     print("🔄 Iniciando ciclo de monitoramento...")
     result = await coordinator.run_cycle()
 
+    # Aguardar consolidação (Workers processam os sites)
+    print("⏳ Aguardando Workers processarem os sites...")
+    print("   (O email consolidado será enviado ao final)")
+    # Aguarda tasks pendentes (consolidation task em background)
+    pending = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
+
     print(f"\n{'='*60}")
     print(f"  Ciclo Concluído")
     print(f"{'='*60}")
