@@ -38,7 +38,7 @@ class TestDefaultConfig:
 
     def test_analyzer_config_defaults(self):
         config = load_config()
-        assert config.analyzer.bedrock_model_id == "anthropic.claude-sonnet-4-6"
+        assert config.analyzer.bedrock_model_id == "us.anthropic.claude-sonnet-4-6"
         assert config.analyzer.bedrock_region == "us-east-1"
         assert config.analyzer.confidence_threshold == 70
         assert config.analyzer.request_timeout_seconds == 60

@@ -1,0 +1,22 @@
+{
+  "containerOverrides": [
+    {
+      "name": "brand-watchdog",
+      "command": ["python", "-m", "brand_watchdog.cli", "run-cycle"],
+      "environment": [
+        {
+          "name": "BRAND_WATCHDOG_QUEUE_QUEUE_URL",
+          "value": "https://sqs.us-east-1.amazonaws.com/761018874615/brand-watchdog-tasks"
+        },
+        {
+          "name": "BRAND_WATCHDOG_STORAGE_S3_BUCKET",
+          "value": "brand-watchdog-screenshots-761018874615"
+        },
+        {
+          "name": "BRAND_WATCHDOG_STORAGE_S3_REGION",
+          "value": "us-east-1"
+        }
+      ]
+    }
+  ]
+}

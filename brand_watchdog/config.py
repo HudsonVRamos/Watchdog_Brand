@@ -30,7 +30,7 @@ class CrawlerConfig:
 class AnalyzerConfig:
     """Configuração do analisador AWS Bedrock."""
 
-    bedrock_model_id: str = "anthropic.claude-sonnet-4-6"
+    bedrock_model_id: str = "us.anthropic.claude-sonnet-4-6"
     bedrock_region: str = "us-east-1"
     confidence_threshold: int = 70
     request_timeout_seconds: int = 60

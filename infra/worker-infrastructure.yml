@@ -208,6 +208,10 @@ Resources:
         - Name: !Sub "${ProjectName}-worker"
           Image: !Ref WorkerImageUri
           Essential: true
+          Command:
+            - "python"
+            - "-m"
+            - "brand_watchdog.worker"
           Environment:
             - Name: BRAND_WATCHDOG_QUEUE_QUEUE_URL
               Value: !Ref WorkerQueue
