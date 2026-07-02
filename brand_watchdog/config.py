@@ -80,7 +80,7 @@ class QueueConfig:
 
     queue_url: str = ""
     dlq_url: str = ""
-    visibility_timeout_seconds: int = 120
+    visibility_timeout_seconds: int = 300
     max_receive_count: int = 3
     batch_size: int = 10
     publish_timeout_minutes: int = 5
@@ -101,8 +101,8 @@ class EventConfig:
 class WorkerConfig:
     """Configuração do Worker ECS."""
 
-    processing_timeout_seconds: int = 120
-    visibility_renew_interval_seconds: int = 60
+    processing_timeout_seconds: int = 300
+    visibility_renew_interval_seconds: int = 90
     consolidation_poll_interval_seconds: int = 30
     consolidation_timeout_minutes: int = 60
     max_concurrent_tasks: int = 10

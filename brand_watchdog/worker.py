@@ -25,11 +25,15 @@ Requirements: 2.1, 2.3, 2.6, 2.7, 2.8, 3.4, 3.5, 8.2
 from __future__ import annotations
 
 import asyncio
+import io
 import logging
 import signal
+import tempfile
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+
+from PIL import Image
 
 from brand_watchdog.analyzer.compliance_analyzer import ComplianceAnalyzer
 from brand_watchdog.analyzer.compliance_prompt_builder import (
@@ -495,7 +499,7 @@ class WorkerMain:
             )
             return True  # Processamento concluído (com falha registrada)
 
-        # 2. Upload para S3
+        # 2. Upload para S3 (imagem original, sem resize)
         png_bytes = capture_result.screenshot_path.read_bytes()
         screenshot_model = await self._screenshot_store.store(
             png_bytes=png_bytes,
@@ -505,16 +509,35 @@ class WorkerMain:
             was_truncated=capture_result.was_truncated,
         )
 
-        # 3. Análise de compliance via Bedrock
-        #    Usa imagens cacheadas do ReferenceImageCache (Req 8.2)
-        report = await self._compliance_analyzer.analyze_compliance(
-            screenshot_path=capture_result.screenshot_path,
-            target_url=message.url,
-            screenshot_ref_id=screenshot_model.id,
-            cycle_id=message.cycle_id,
-            brand=message.brand,
-            target_site_id=message.site_id,
+        # 3. Resize do screenshot para respeitar limites do Bedrock
+        #    (max 8000px de dimensão, max ~4.5MB de payload)
+        png_bytes_for_analysis = self._resize_for_bedrock(png_bytes)
+
+        # Escrever imagem resized em arquivo temporário para o analyzer
+        tmp_screenshot_path = Path(
+            tempfile.mktemp(suffix=".png", prefix="bw_resize_")
         )
+        try:
+            tmp_screenshot_path.write_bytes(png_bytes_for_analysis)
+
+            # 4. Análise de compliance via Bedrock
+            #    Usa imagens cacheadas do ReferenceImageCache (Req 8.2)
+            report = (
+                await self._compliance_analyzer.analyze_compliance(
+                    screenshot_path=tmp_screenshot_path,
+                    target_url=message.url,
+                    screenshot_ref_id=screenshot_model.id,
+                    cycle_id=message.cycle_id,
+                    brand=message.brand,
+                    target_site_id=message.site_id,
+                )
+            )
+        finally:
+            # Cleanup do arquivo temporário
+            try:
+                tmp_screenshot_path.unlink(missing_ok=True)
+            except OSError:
+                pass
 
         # Contar detecções (regras FAIL)
         detections_count = sum(
@@ -556,6 +579,8 @@ class WorkerMain:
 
         Persiste o resultado do processamento (sucesso ou falha)
         para que o CycleConsolidator possa consolidar o ciclo.
+        Se o resultado já existir (duplicata site_id + cycle_id),
+        ignora silenciosamente.
 
         Args:
             message: Mensagem de processamento com site_id e cycle_id.
@@ -585,14 +610,23 @@ class WorkerMain:
                 detections_count,
             )
         except Exception as exc:
-            logger.error(
-                "Falha ao registrar SiteCycleResult: "
-                "site_id=%s, cycle_id=%s, status=%s, erro=%s",
-                message.site_id,
-                message.cycle_id,
-                status,
-                str(exc),
-            )
+            # Duplicata (UniqueViolation) — ignorar silenciosamente
+            if "UniqueViolation" in str(exc) or "uq_site_cycle" in str(exc):
+                logger.info(
+                    "SiteCycleResult já existe (duplicata ignorada): "
+                    "site_id=%s, cycle_id=%s",
+                    message.site_id,
+                    message.cycle_id,
+                )
+            else:
+                logger.error(
+                    "Falha ao registrar SiteCycleResult: "
+                    "site_id=%s, cycle_id=%s, status=%s, erro=%s",
+                    message.site_id,
+                    message.cycle_id,
+                    status,
+                    str(exc),
+                )
 
     async def _publish_event(
         self,
@@ -661,6 +695,69 @@ class WorkerMain:
                 config=self._config.crawler,
                 storage_config=self._config.storage,
             )
+
+    def _resize_for_bedrock(self, png_bytes: bytes) -> bytes:
+        """Redimensiona screenshot para respeitar limites do Bedrock.
+
+        Limites da API Bedrock/Anthropic:
+        - Dimensão máxima: 8000px (largura ou altura)
+        - Tamanho máximo recomendado: ~4.5MB
+
+        Se a imagem excede 8000px em qualquer dimensão, redimensiona
+        proporcionalmente. Se o resultado ainda excede 4.5MB, converte
+        para JPEG com quality=80 para reduzir tamanho.
+
+        Args:
+            png_bytes: Bytes originais do screenshot PNG.
+
+        Returns:
+            Bytes da imagem redimensionada (PNG ou JPEG).
+        """
+        max_dim = 8000
+        max_size_bytes = 4_500_000
+
+        try:
+            img = Image.open(io.BytesIO(png_bytes))
+        except Exception as exc:
+            logger.warning(
+                "Não foi possível abrir imagem para resize: %s",
+                str(exc),
+            )
+            return png_bytes
+
+        # Redimensionar se dimensões excedem 8000px
+        if img.width > max_dim or img.height > max_dim:
+            ratio = min(max_dim / img.width, max_dim / img.height)
+            new_size = (int(img.width * ratio), int(img.height * ratio))
+            img = img.resize(new_size, Image.LANCZOS)
+            buf = io.BytesIO()
+            img.save(buf, format="PNG")
+            png_bytes = buf.getvalue()
+            logger.info(
+                "Screenshot redimensionado para Bedrock: "
+                "%dx%d → %dx%d (%d bytes)",
+                img.width,
+                img.height,
+                new_size[0],
+                new_size[1],
+                len(png_bytes),
+            )
+
+        # Se ainda > 4.5MB, converter para JPEG com quality reduzida
+        if len(png_bytes) > max_size_bytes:
+            img = Image.open(io.BytesIO(png_bytes))
+            if img.mode == "RGBA":
+                img = img.convert("RGB")
+            buf = io.BytesIO()
+            img.save(buf, format="JPEG", quality=80)
+            png_bytes = buf.getvalue()
+            logger.info(
+                "Screenshot convertido para JPEG (quality=80) "
+                "para Bedrock: %d bytes",
+                len(png_bytes),
+            )
+
+        return png_bytes
 
 
 def _handle_signal(worker: WorkerMain) -> None:
