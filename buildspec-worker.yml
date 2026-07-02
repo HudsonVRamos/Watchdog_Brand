@@ -1,16 +1,11 @@
 version: 0.2
 
-env:
-  variables:
-    AWS_ACCOUNT_ID: "761018874615"
-    AWS_DEFAULT_REGION: "us-east-1"
-
 phases:
   pre_build:
     commands:
       - echo Logging in to Amazon ECR...
-      - aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
-      - REPOSITORY_URI=$AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/brand-watchdog
+      - aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin 761018874615.dkr.ecr.us-east-1.amazonaws.com
+      - REPOSITORY_URI=761018874615.dkr.ecr.us-east-1.amazonaws.com/brand-watchdog
   build:
     commands:
       - echo Building Worker Docker image...
@@ -22,4 +17,4 @@ phases:
       - echo Pushing images...
       - docker push $REPOSITORY_URI:worker-latest
       - docker push $REPOSITORY_URI:latest
-      - echo All images pushed successfully
+      - echo Done.
