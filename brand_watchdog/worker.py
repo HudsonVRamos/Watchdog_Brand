@@ -31,6 +31,10 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
+from brand_watchdog.alerts.compliance_email_notifier import (
+    ComplianceEmailNotifier,
+)
+from brand_watchdog.alerts.email_providers import create_email_provider
 from brand_watchdog.analyzer.compliance_analyzer import ComplianceAnalyzer
 from brand_watchdog.analyzer.compliance_prompt_builder import (
     BRAND_REFERENCE_IMAGES,
@@ -90,6 +94,7 @@ class WorkerMain:
         self._event_publisher: EventPublisher | None = None
         self._reference_cache: ReferenceImageCache | None = None
         self._prompt_builder: CompliancePromptBuilder | None = None
+        self._email_notifier: ComplianceEmailNotifier | None = None
 
         # Controle de ciclo para limpeza de cache
         self._current_cycle_id: str | None = None
@@ -153,6 +158,13 @@ class WorkerMain:
         self._reference_cache = ReferenceImageCache(
             max_size_px=self._config.cache.max_image_size_px,
             jpeg_quality=self._config.cache.jpeg_quality,
+        )
+
+        # Email Notifier (envio direto após análise)
+        email_provider = create_email_provider(self._config.alert)
+        self._email_notifier = ComplianceEmailNotifier(
+            config=self._config.alert,
+            email_provider=email_provider,
         )
 
         # Pre-carregar imagens de referência no cache
@@ -532,6 +544,9 @@ class WorkerMain:
         # 5. Publicar evento no EventBridge (falha não impede conclusão)
         await self._publish_event(message, report, screenshot_model.s3_key)
 
+        # 6. Enviar email de compliance (falha não impede conclusão)
+        await self._send_email(report)
+
         logger.info(
             "Site processado com sucesso: site_id=%s, "
             "cycle_id=%s, url=%s, detections=%d, "
@@ -639,6 +654,40 @@ class WorkerMain:
                 "(processamento continua): site_id=%s, cycle_id=%s",
                 message.site_id,
                 message.cycle_id,
+            )
+
+    async def _send_email(self, report) -> None:
+        """Envia email de compliance para os destinatários configurados.
+
+        A falha de envio NÃO impede a conclusão do processamento.
+
+        Args:
+            report: ComplianceReport com resultados da análise.
+        """
+        if self._email_notifier is None:
+            return
+
+        try:
+            recipients = self._config.alert.recipients
+            if isinstance(recipients, str):
+                recipients = [r.strip() for r in recipients.split(",")]
+
+            await self._email_notifier.send_compliance_report(
+                report=report,
+                recipients=recipients,
+            )
+            logger.info(
+                "Email de compliance enviado: target_url=%s, "
+                "overall_status=%s",
+                report.target_url,
+                report.overall_status,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Falha ao enviar email de compliance "
+                "(processamento continua): target_url=%s, erro=%s",
+                report.target_url,
+                str(exc),
             )
 
     async def _cleanup_chromium(self) -> None:
