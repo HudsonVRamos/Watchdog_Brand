@@ -233,7 +233,29 @@ async def run_cycle() -> None:
         queue_url=config.queue.queue_url,
         region=config.storage.s3_region,
     )
-    consolidator = CycleConsolidator(config=config.worker)
+
+    # Email Notifier para relatório consolidado
+    from brand_watchdog.alerts.compliance_email_notifier import (
+        ComplianceEmailNotifier,
+    )
+    from brand_watchdog.alerts.email_providers import (
+        create_email_provider,
+    )
+
+    email_provider = create_email_provider(config.alert)
+    email_notifier = ComplianceEmailNotifier(
+        config=config.alert,
+        email_provider=email_provider,
+    )
+    recipients = config.alert.recipients
+    if isinstance(recipients, str):
+        recipients = [r.strip() for r in recipients.split(",")]
+
+    consolidator = CycleConsolidator(
+        config=config.worker,
+        email_notifier=email_notifier,
+        recipients=recipients,
+    )
     target_site_manager = TargetSiteManager(
         max_target_sites=config.max_target_sites,
     )

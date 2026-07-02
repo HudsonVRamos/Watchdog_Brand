@@ -3,7 +3,8 @@
 Realiza polling periódico no banco de dados para verificar
 quantos sites já completaram processamento dentro de um ciclo.
 Quando todos completam ou o timeout é atingido, atualiza o
-status do ciclo com os contadores finais.
+status do ciclo com os contadores finais e envia email
+consolidado com relatório de compliance.
 
 Requirements: 3.1, 3.2, 3.3
 """
@@ -34,14 +35,22 @@ class CycleConsolidator:
     Realiza polling periódico no banco para contar registros
     de SiteCycleResult associados a um cycle_id. Quando todos
     os sites estão completos ou o timeout de 60 minutos é
-    atingido, atualiza o ciclo com status e contadores finais.
+    atingido, atualiza o ciclo com status e contadores finais
+    e envia email consolidado com relatório em anexo.
 
     Args:
         config: Configuração do Worker com intervalos de polling
             e timeout de consolidação.
+        email_notifier: Notificador de email (opcional).
+        recipients: Lista de destinatários para o email consolidado.
     """
 
-    def __init__(self, config: WorkerConfig) -> None:
+    def __init__(
+        self,
+        config: WorkerConfig,
+        email_notifier=None,
+        recipients: list[str] | None = None,
+    ) -> None:
         self._config = config
         self._poll_interval = (
             config.consolidation_poll_interval_seconds
@@ -49,6 +58,8 @@ class CycleConsolidator:
         self._timeout_minutes = (
             config.consolidation_timeout_minutes
         )
+        self._email_notifier = email_notifier
+        self._recipients = recipients or []
 
     async def consolidate(
         self, cycle_id: str, sites_dispatched: int
@@ -105,6 +116,8 @@ class CycleConsolidator:
                     cycle_id,
                     status,
                 )
+                # Enviar email consolidado do ciclo
+                await self._send_consolidated_email(cycle_id)
                 return status
 
             # Verifica timeout
@@ -344,3 +357,131 @@ class CycleConsolidator:
         )
 
         return MonitoringCycleModel.STATUS_COMPLETED_WITH_TIMEOUT
+
+    async def _send_consolidated_email(
+        self, cycle_id: str
+    ) -> None:
+        """Envia email consolidado com relatório de todos os sites do ciclo.
+
+        Busca os ComplianceReports de todos os sites processados no ciclo
+        e envia um único email com relatório em arquivo anexo.
+        Falha no envio não impede conclusão — apenas loga o erro.
+
+        Args:
+            cycle_id: ID do ciclo consolidado.
+        """
+        if self._email_notifier is None:
+            logger.debug(
+                "Email notifier não configurado, pulando envio"
+            )
+            return
+
+        if not self._recipients:
+            logger.warning(
+                "Nenhum destinatário configurado para email"
+            )
+            return
+
+        try:
+            # Busca os reports do banco (detection_results + sites do ciclo)
+            from brand_watchdog.models.dataclasses import (
+                ComplianceReport,
+                ComplianceRuleResult,
+            )
+
+            reports: list[ComplianceReport] = []
+
+            async with get_session() as session:
+                # Busca resultados com sucesso para este ciclo
+                stmt = (
+                    select(SiteCycleResultModel)
+                    .where(
+                        SiteCycleResultModel.cycle_id == cycle_id,
+                        SiteCycleResultModel.status == "success",
+                    )
+                )
+                result = await session.execute(stmt)
+                site_results = result.scalars().all()
+
+                for site_result in site_results:
+                    # Busca o target_site para obter a URL
+                    site_stmt = select(TargetSiteModel).where(
+                        TargetSiteModel.id == site_result.site_id
+                    )
+                    site_row = await session.execute(site_stmt)
+                    target_site = site_row.scalar_one_or_none()
+
+                    if target_site is None:
+                        continue
+
+                    # Busca detection_results para este site/ciclo
+                    from brand_watchdog.models.entities import (
+                        DetectionResultModel,
+                    )
+                    det_stmt = select(DetectionResultModel).where(
+                        DetectionResultModel.target_site_id == site_result.site_id,
+                        DetectionResultModel.monitoring_cycle_id == cycle_id,
+                    )
+                    det_result = await session.execute(det_stmt)
+                    detections = det_result.scalars().all()
+
+                    # Monta rule_results a partir das detecções
+                    rule_results = [
+                        ComplianceRuleResult(
+                            rule_id=d.match_type or "unknown",
+                            status="FAIL",
+                            confidence=d.confidence or 0,
+                            description=d.description or "",
+                        )
+                        for d in detections
+                    ]
+
+                    overall_status = (
+                        "non_compliant" if rule_results else "compliant"
+                    )
+
+                    report = ComplianceReport(
+                        target_url=target_site.url,
+                        analyzed_at=site_result.completed_at,
+                        overall_status=overall_status,
+                        rule_results=rule_results,
+                        screenshot_ref_id="",
+                        cycle_id=cycle_id,
+                    )
+                    reports.append(report)
+
+            if not reports:
+                logger.info(
+                    "Nenhum relatório para enviar no ciclo %s",
+                    cycle_id,
+                )
+                return
+
+            # Envia email consolidado (1 email, relatório em arquivo)
+            success = await self._email_notifier.send_cycle_report(
+                reports=reports,
+                recipients=self._recipients,
+            )
+
+            if success:
+                logger.info(
+                    "Email consolidado enviado: cycle_id=%s, "
+                    "sites=%d, recipients=%d",
+                    cycle_id,
+                    len(reports),
+                    len(self._recipients),
+                )
+            else:
+                logger.warning(
+                    "Falha ao enviar email consolidado: "
+                    "cycle_id=%s",
+                    cycle_id,
+                )
+
+        except Exception as exc:
+            logger.error(
+                "Erro ao enviar email consolidado: "
+                "cycle_id=%s, erro=%s",
+                cycle_id,
+                str(exc),
+            )
