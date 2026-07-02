@@ -209,25 +209,25 @@ Resources:
           Image: !Ref WorkerImageUri
           Essential: true
           Environment:
-            - Name: QUEUE_URL
+            - Name: BRAND_WATCHDOG_QUEUE_QUEUE_URL
               Value: !Ref WorkerQueue
-            - Name: DLQ_URL
+            - Name: BRAND_WATCHDOG_QUEUE_DLQ_URL
               Value: !Ref WorkerDeadLetterQueue
-            - Name: S3_BUCKET
+            - Name: BRAND_WATCHDOG_STORAGE_S3_BUCKET
               Value: !Ref S3BucketName
-            - Name: DATABASE_URL
+            - Name: BRAND_WATCHDOG_STORAGE_DATABASE_URL
               Value: !Ref DatabaseUrl
-            - Name: ALERT_SES_SENDER
+            - Name: BRAND_WATCHDOG_ALERT_SES_SENDER
               Value: !Ref AlertSender
-            - Name: ALERT_RECIPIENTS
+            - Name: BRAND_WATCHDOG_ALERT_RECIPIENTS
               Value: !Ref AlertRecipients
             - Name: AWS_DEFAULT_REGION
               Value: us-east-1
-            - Name: WORKER_PROCESSING_TIMEOUT
+            - Name: BRAND_WATCHDOG_WORKER_PROCESSING_TIMEOUT_SECONDS
               Value: "120"
-            - Name: WORKER_VISIBILITY_RENEW_INTERVAL
+            - Name: BRAND_WATCHDOG_WORKER_VISIBILITY_RENEW_INTERVAL_SECONDS
               Value: "60"
-            - Name: WORKER_VISIBILITY_TIMEOUT
+            - Name: BRAND_WATCHDOG_QUEUE_VISIBILITY_TIMEOUT_SECONDS
               Value: "120"
           LogConfiguration:
             LogDriver: awslogs

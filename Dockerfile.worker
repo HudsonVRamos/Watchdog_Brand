@@ -28,6 +28,8 @@ RUN playwright install --with-deps chromium
 COPY brand_watchdog/ ./brand_watchdog/
 COPY config.yaml ./config.yaml
 COPY watchdog_rules/ ./watchdog_rules/
+COPY alembic.ini ./alembic.ini
+COPY migrations/ ./migrations/
 
 # Cria diretórios de dados (temporários, screenshots vão para S3)
 RUN mkdir -p /app/data
