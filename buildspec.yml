@@ -13,13 +13,12 @@ phases:
       - REPOSITORY_URI=$AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/brand-watchdog
   build:
     commands:
-      - echo Building Worker Docker image...
-      - docker build -f Dockerfile.worker -t $REPOSITORY_URI:worker-latest .
       - echo Building Coordinator Docker image...
       - docker build -t $REPOSITORY_URI:latest .
+      - docker tag $REPOSITORY_URI:latest $REPOSITORY_URI:worker-latest
   post_build:
     commands:
       - echo Pushing images...
-      - docker push $REPOSITORY_URI:worker-latest
       - docker push $REPOSITORY_URI:latest
+      - docker push $REPOSITORY_URI:worker-latest
       - echo All images pushed successfully
