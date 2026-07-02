@@ -1,21 +1,17 @@
 """Testes unitários para o entry point brand_watchdog.main.
 
-Valida inicialização de configuração, resolução de path,
-criação de email provider e fluxo geral do main().
+Valida inicialização de configuração, resolução de path
+e fluxo geral do main().
 """
 
 from __future__ import annotations
 
 import asyncio
-import signal
-from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
-from brand_watchdog.config import AppConfig
 from brand_watchdog.main import (
-    _create_email_provider,
     _resolve_config_path,
     _setup_logging,
     main,
@@ -49,28 +45,6 @@ class TestResolveConfigPath:
         assert result.exists()
 
 
-class TestCreateEmailProvider:
-    """Testes para _create_email_provider."""
-
-    def test_creates_ses_provider_by_default(self):
-        """Deve criar SESProvider quando provider='ses'."""
-        from brand_watchdog.alerts.email_providers import SESProvider
-
-        config = AppConfig()
-        config.alert.provider = "ses"
-        provider = _create_email_provider(config)
-        assert isinstance(provider, SESProvider)
-
-    def test_creates_smtp_provider(self):
-        """Deve criar SMTPProvider quando provider='smtp'."""
-        from brand_watchdog.alerts.email_providers import SMTPProvider
-
-        config = AppConfig()
-        config.alert.provider = "smtp"
-        provider = _create_email_provider(config)
-        assert isinstance(provider, SMTPProvider)
-
-
 class TestMain:
     """Testes para a função main()."""
 
@@ -100,8 +74,6 @@ class TestMain:
         mock_scheduler_cls.return_value = mock_scheduler_instance
 
         # Simular shutdown imediato via evento
-        original_event_wait = asyncio.Event.wait
-
         async def fake_wait(self):
             """Simula recebimento de sinal imediato."""
             self.set()

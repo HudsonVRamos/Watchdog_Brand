@@ -198,6 +198,7 @@ class ComplianceReport:
     rule_results: list[ComplianceRuleResult] = field(default_factory=list)
     screenshot_ref_id: str = ""
     cycle_id: str = ""
+    rule_set_version: str = ""
 
     _VALID_OVERALL_STATUSES: ClassVar[tuple[str, ...]] = (
         "compliant",
@@ -234,6 +235,7 @@ class ComplianceReport:
             "rule_results": [r.to_dict() for r in self.rule_results],
             "screenshot_ref_id": self.screenshot_ref_id,
             "cycle_id": self.cycle_id,
+            "rule_set_version": self.rule_set_version,
         }
 
     @classmethod
@@ -248,4 +250,5 @@ class ComplianceReport:
             ],
             screenshot_ref_id=data["screenshot_ref_id"],
             cycle_id=data["cycle_id"],
+            rule_set_version=data.get("rule_set_version", ""),
         )

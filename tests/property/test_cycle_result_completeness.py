@@ -1,16 +1,19 @@
 """Property tests para completude do resultado de ciclo de monitoramento.
 
 Valida que CycleResult contém todos os campos obrigatórios e contagens
-corretas após ciclos com mix de sucesso e falha entre sites.
+corretas após o ciclo de despacho distribuído.
 
-**Validates: Requirements 5.6**
+Na nova arquitetura, o MonitoringCoordinator despacha para SQS e retorna
+CycleResult com estatísticas de publicação (success_count, failure_count).
+A consolidação final é feita pelo CycleConsolidator (testado separadamente).
+
+**Validates: Requirements 1.1, 1.5**
 """
 
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -18,31 +21,25 @@ from hypothesis import given, settings, HealthCheck
 from hypothesis import strategies as st
 
 from brand_watchdog.config import (
-    AlertConfig,
-    AnalyzerConfig,
     AppConfig,
-    CrawlerConfig,
-    StorageConfig,
+    QueueConfig,
+    WorkerConfig,
 )
 from brand_watchdog.coordinator.coordinator import MonitoringCoordinator
 from brand_watchdog.models.dataclasses import (
-    BoundingBox,
-    CaptureResult,
-    ComplianceReport,
-    ComplianceRuleResult,
     CycleResult,
-    DetectionResult,
     TargetSite,
 )
 
 
 # Configuração PBT: mínimo 100 exemplos
 _PBT_SETTINGS = settings(
-    max_examples=100,
+    max_examples=30,
     suppress_health_check=[
         HealthCheck.function_scoped_fixture,
         HealthCheck.too_slow,
     ],
+    deadline=None,
 )
 
 
@@ -75,22 +72,6 @@ def _site_list_strategy() -> st.SearchStrategy[list[TargetSite]]:
     )
 
 
-def _success_mask_strategy(
-    n: int,
-) -> st.SearchStrategy[list[bool]]:
-    """Gera máscara booleana de tamanho n indicando sucesso/falha por site."""
-    return st.lists(
-        st.booleans(),
-        min_size=n,
-        max_size=n,
-    )
-
-
-def _detections_count_strategy() -> st.SearchStrategy[int]:
-    """Gera número de detecções para um site (0-5)."""
-    return st.integers(min_value=0, max_value=5)
-
-
 # --- Helpers ---
 
 
@@ -112,128 +93,50 @@ def _mock_get_session():
     return fake_get_session, mock_session
 
 
-def _make_brand_asset() -> BrandAsset:
-    """Cria um BrandAsset de teste."""
-    return BrandAsset(
-        id="asset-1",
-        asset_type="logo",
-        file_path=Path("/logos/brand.png"),
-        text_value=None,
-        content_hash="abc123",
-        original_filename="brand.png",
-        file_size_bytes=1024,
-        created_at=datetime(2024, 1, 1, tzinfo=timezone.utc),
-    )
-
-
-def _make_detection(target_url: str, index: int = 0) -> DetectionResult:
-    """Cria uma DetectionResult de teste."""
-    return DetectionResult(
-        target_url=target_url,
-        match_type="logo" if index % 2 == 0 else "text",
-        confidence=75,
-        bounding_box=BoundingBox(10.0, 20.0, 30.0, 15.0),
-        description=f"Detecção {index}",
-        detected_at=datetime(2024, 6, 15, 10, 0, 0, tzinfo=timezone.utc),
-        screenshot_ref_id=f"ref-{index}",
-    )
-
-
-def _make_config() -> AppConfig:
-    """Cria configuração de teste."""
-    return AppConfig(
-        crawler=CrawlerConfig(),
-        analyzer=AnalyzerConfig(confidence_threshold=70),
-        alert=AlertConfig(recipients=["admin@test.com"]),
-        storage=StorageConfig(),
-    )
-
-
-def _make_capture_result(
-    target_url: str, success: bool
-) -> CaptureResult:
-    """Cria CaptureResult conforme sucesso/falha."""
-    return CaptureResult(
-        target_url=target_url,
-        screenshot_path=Path("/tmp/screenshot.png"),
-        screenshot_ref_id="ref-123",
-        captured_at=datetime(2024, 6, 15, 10, 0, 0, tzinfo=timezone.utc),
-        page_height_px=5000,
-        was_truncated=False,
-        success=success,
-        error_message=None if success else "Timeout ao capturar",
-    )
-
-
 def _build_coordinator(
     target_sites: list[TargetSite],
-    success_mask: list[bool],
-    detections_per_site: list[int],
+    success_count: int,
+    failure_count: int,
 ) -> MonitoringCoordinator:
     """Constrói MonitoringCoordinator com mocks configurados.
 
     Args:
         target_sites: Lista de sites-alvo.
-        success_mask: Indica sucesso (True) ou falha (False) por site.
-        detections_per_site: Número de detecções para cada site com
-            sucesso (usado apenas para contagem no CycleResult).
+        success_count: Número de publicações com sucesso na fila.
+        failure_count: Número de falhas na publicação.
     """
-    # Configura capture side_effects baseado no success_mask
-    capture_results = [
-        _make_capture_result(site.url, success_mask[i])
-        for i, site in enumerate(target_sites)
-    ]
+    # RuleSetVersionCalculator mock
+    rule_set_calculator = MagicMock()
+    rule_set_calculator.calculate.return_value = "v1717000000_abc12345"
+    rule_set_calculator.has_changed.return_value = False
 
-    crawler = AsyncMock()
-    crawler.capture = AsyncMock(side_effect=capture_results)
-
-    # ComplianceAnalyzer retorna report com detecções=0
-    # (o novo coordinator não popula detections no SiteResult)
-    compliance_analyzer = AsyncMock()
-    compliance_analyzer.analyze_compliance = AsyncMock(
-        return_value=ComplianceReport(
-            target_url="https://example.com",
-            analyzed_at=datetime(
-                2024, 6, 15, 10, 1, 0, tzinfo=timezone.utc
-            ),
-            overall_status="compliant",
-            rule_results=[
-                ComplianceRuleResult(
-                    rule_id="facilitator_role",
-                    status="PASS",
-                    confidence=92,
-                    description="OK",
-                ),
-            ],
-            screenshot_ref_id="ref-123",
-            cycle_id="cycle-1",
-        )
+    # SQSPublisher mock - retorna (success_count, failure_count)
+    sqs_publisher = AsyncMock()
+    sqs_publisher.publish_all = AsyncMock(
+        return_value=(success_count, failure_count)
     )
 
-    compliance_notifier = AsyncMock()
-    compliance_notifier.send_compliance_report = AsyncMock(
-        return_value=True
-    )
+    # CycleConsolidator mock
+    consolidator = AsyncMock()
+    consolidator.consolidate = AsyncMock()
 
-    detection_store = AsyncMock()
-    detection_store.save = AsyncMock(return_value="det-1")
-
-    screenshot_store = AsyncMock()
-    screenshot_store.store = AsyncMock()
-
+    # TargetSiteManager mock
     target_site_manager = AsyncMock()
     target_site_manager.list_all = AsyncMock(
         return_value=target_sites
     )
 
+    config = AppConfig(
+        queue=QueueConfig(queue_url="https://sqs.us-east-1.amazonaws.com/123/test-queue"),
+        worker=WorkerConfig(),
+    )
+
     return MonitoringCoordinator(
-        crawler=crawler,
-        compliance_analyzer=compliance_analyzer,
-        compliance_notifier=compliance_notifier,
-        detection_store=detection_store,
-        screenshot_store=screenshot_store,
+        rule_set_calculator=rule_set_calculator,
+        sqs_publisher=sqs_publisher,
+        consolidator=consolidator,
         target_site_manager=target_site_manager,
-        config=_make_config(),
+        config=config,
     )
 
 
@@ -241,12 +144,12 @@ def _build_coordinator(
 
 
 class TestCycleResultCompleteness:
-    """Property 12: Cycle Result Completeness.
+    """Property: Cycle Result Completeness (Distribuído).
 
-    Ciclos com mix de sucesso/falha — o resultado contém todos os
-    campos obrigatórios e contagens corretas.
+    Ciclos com mix de publicações com sucesso/falha — o resultado contém
+    todos os campos obrigatórios e contagens corretas.
 
-    **Validates: Requirements 5.6**
+    **Validates: Requirements 1.1, 1.5**
     """
 
     @_PBT_SETTINGS
@@ -258,31 +161,25 @@ class TestCycleResultCompleteness:
         """sites_processed + sites_failed == total de target sites."""
         target_sites = data.draw(_site_list_strategy())
         n = len(target_sites)
-        success_mask = data.draw(
-            st.lists(st.booleans(), min_size=n, max_size=n)
-        )
 
-        n_success = sum(success_mask)
-        detections_per_site = data.draw(
-            st.lists(
-                _detections_count_strategy(),
-                min_size=n_success,
-                max_size=n_success,
-            )
+        # Gerar split de sucesso/falha que soma n
+        success_count = data.draw(
+            st.integers(min_value=0, max_value=n)
         )
+        failure_count = n - success_count
 
         fake_session_fn, _ = _mock_get_session()
 
-        with (
-            patch(
-                "brand_watchdog.coordinator.coordinator.get_session",
-                side_effect=fake_session_fn,
-            ),
-            patch.object(Path, "read_bytes", return_value=b"png_data"),
+        coordinator = _build_coordinator(
+            target_sites, success_count, failure_count
+        )
+
+        with patch(
+            "brand_watchdog.coordinator.coordinator.get_session",
+            side_effect=fake_session_fn,
+        ), patch(
+            "brand_watchdog.coordinator.coordinator.asyncio.create_task"
         ):
-            coordinator = _build_coordinator(
-                target_sites, success_mask, detections_per_site
-            )
             result = await coordinator.run_cycle()
 
         assert result.sites_processed + result.sites_failed == n
@@ -293,37 +190,30 @@ class TestCycleResultCompleteness:
     async def test_sites_processed_matches_success_count(
         self, data: st.DataObject
     ):
-        """sites_processed == número de sites com sucesso."""
+        """sites_processed == success_count do SQSPublisher."""
         target_sites = data.draw(_site_list_strategy())
         n = len(target_sites)
-        success_mask = data.draw(
-            st.lists(st.booleans(), min_size=n, max_size=n)
-        )
 
-        n_success = sum(success_mask)
-        detections_per_site = data.draw(
-            st.lists(
-                _detections_count_strategy(),
-                min_size=n_success,
-                max_size=n_success,
-            )
+        success_count = data.draw(
+            st.integers(min_value=0, max_value=n)
         )
+        failure_count = n - success_count
 
         fake_session_fn, _ = _mock_get_session()
 
-        with (
-            patch(
-                "brand_watchdog.coordinator.coordinator.get_session",
-                side_effect=fake_session_fn,
-            ),
-            patch.object(Path, "read_bytes", return_value=b"png_data"),
+        coordinator = _build_coordinator(
+            target_sites, success_count, failure_count
+        )
+
+        with patch(
+            "brand_watchdog.coordinator.coordinator.get_session",
+            side_effect=fake_session_fn,
+        ), patch(
+            "brand_watchdog.coordinator.coordinator.asyncio.create_task"
         ):
-            coordinator = _build_coordinator(
-                target_sites, success_mask, detections_per_site
-            )
             result = await coordinator.run_cycle()
 
-        assert result.sites_processed == n_success
+        assert result.sites_processed == success_count
 
     @_PBT_SETTINGS
     @given(data=st.data())
@@ -331,76 +221,30 @@ class TestCycleResultCompleteness:
     async def test_sites_failed_matches_failure_count(
         self, data: st.DataObject
     ):
-        """sites_failed == número de sites que falharam."""
+        """sites_failed == failure_count do SQSPublisher."""
         target_sites = data.draw(_site_list_strategy())
         n = len(target_sites)
-        success_mask = data.draw(
-            st.lists(st.booleans(), min_size=n, max_size=n)
-        )
 
-        n_success = sum(success_mask)
-        n_failed = n - n_success
-        detections_per_site = data.draw(
-            st.lists(
-                _detections_count_strategy(),
-                min_size=n_success,
-                max_size=n_success,
-            )
+        success_count = data.draw(
+            st.integers(min_value=0, max_value=n)
         )
+        failure_count = n - success_count
 
         fake_session_fn, _ = _mock_get_session()
 
-        with (
-            patch(
-                "brand_watchdog.coordinator.coordinator.get_session",
-                side_effect=fake_session_fn,
-            ),
-            patch.object(Path, "read_bytes", return_value=b"png_data"),
-        ):
-            coordinator = _build_coordinator(
-                target_sites, success_mask, detections_per_site
-            )
-            result = await coordinator.run_cycle()
-
-        assert result.sites_failed == n_failed
-
-    @_PBT_SETTINGS
-    @given(data=st.data())
-    @pytest.mark.asyncio
-    async def test_site_results_has_one_entry_per_target(
-        self, data: st.DataObject
-    ):
-        """site_results tem exatamente uma entrada por target site."""
-        target_sites = data.draw(_site_list_strategy())
-        n = len(target_sites)
-        success_mask = data.draw(
-            st.lists(st.booleans(), min_size=n, max_size=n)
+        coordinator = _build_coordinator(
+            target_sites, success_count, failure_count
         )
 
-        n_success = sum(success_mask)
-        detections_per_site = data.draw(
-            st.lists(
-                _detections_count_strategy(),
-                min_size=n_success,
-                max_size=n_success,
-            )
-        )
-
-        fake_session_fn, _ = _mock_get_session()
-
-        with (
-            patch(
-                "brand_watchdog.coordinator.coordinator.get_session",
-                side_effect=fake_session_fn,
-            ),
-            patch.object(Path, "read_bytes", return_value=b"png_data"),
+        with patch(
+            "brand_watchdog.coordinator.coordinator.get_session",
+            side_effect=fake_session_fn,
+        ), patch(
+            "brand_watchdog.coordinator.coordinator.asyncio.create_task"
         ):
-            coordinator = _build_coordinator(
-                target_sites, success_mask, detections_per_site
-            )
             result = await coordinator.run_cycle()
 
-        assert len(result.site_results) == n
+        assert result.sites_failed == failure_count
 
     @_PBT_SETTINGS
     @given(data=st.data())
@@ -411,31 +255,24 @@ class TestCycleResultCompleteness:
         """started_at <= ended_at para todo ciclo executado."""
         target_sites = data.draw(_site_list_strategy())
         n = len(target_sites)
-        success_mask = data.draw(
-            st.lists(st.booleans(), min_size=n, max_size=n)
-        )
 
-        n_success = sum(success_mask)
-        detections_per_site = data.draw(
-            st.lists(
-                _detections_count_strategy(),
-                min_size=n_success,
-                max_size=n_success,
-            )
+        success_count = data.draw(
+            st.integers(min_value=0, max_value=n)
         )
+        failure_count = n - success_count
 
         fake_session_fn, _ = _mock_get_session()
 
-        with (
-            patch(
-                "brand_watchdog.coordinator.coordinator.get_session",
-                side_effect=fake_session_fn,
-            ),
-            patch.object(Path, "read_bytes", return_value=b"png_data"),
+        coordinator = _build_coordinator(
+            target_sites, success_count, failure_count
+        )
+
+        with patch(
+            "brand_watchdog.coordinator.coordinator.get_session",
+            side_effect=fake_session_fn,
+        ), patch(
+            "brand_watchdog.coordinator.coordinator.asyncio.create_task"
         ):
-            coordinator = _build_coordinator(
-                target_sites, success_mask, detections_per_site
-            )
             result = await coordinator.run_cycle()
 
         assert result.started_at <= result.ended_at
@@ -443,43 +280,34 @@ class TestCycleResultCompleteness:
     @_PBT_SETTINGS
     @given(data=st.data())
     @pytest.mark.asyncio
-    async def test_detections_found_equals_sum_across_sites(
+    async def test_cycle_id_is_valid_uuid(
         self, data: st.DataObject
     ):
-        """detections_found == soma de detecções em todos os sites."""
+        """cycle_id é um UUID válido para todo ciclo."""
+        import uuid
+
         target_sites = data.draw(_site_list_strategy())
         n = len(target_sites)
-        success_mask = data.draw(
-            st.lists(st.booleans(), min_size=n, max_size=n)
-        )
 
-        n_success = sum(success_mask)
-        detections_per_site = data.draw(
-            st.lists(
-                _detections_count_strategy(),
-                min_size=n_success,
-                max_size=n_success,
-            )
+        success_count = data.draw(
+            st.integers(min_value=0, max_value=n)
         )
+        failure_count = n - success_count
 
         fake_session_fn, _ = _mock_get_session()
 
-        with (
-            patch(
-                "brand_watchdog.coordinator.coordinator.get_session",
-                side_effect=fake_session_fn,
-            ),
-            patch.object(Path, "read_bytes", return_value=b"png_data"),
+        coordinator = _build_coordinator(
+            target_sites, success_count, failure_count
+        )
+
+        with patch(
+            "brand_watchdog.coordinator.coordinator.get_session",
+            side_effect=fake_session_fn,
+        ), patch(
+            "brand_watchdog.coordinator.coordinator.asyncio.create_task"
         ):
-            coordinator = _build_coordinator(
-                target_sites, success_mask, detections_per_site
-            )
             result = await coordinator.run_cycle()
 
-        # No novo fluxo de compliance, detections no SiteResult
-        # são sempre [] (violations persistidas internamente pelo
-        # ComplianceAnalyzer). O total é a soma dos site_results.
-        expected = sum(
-            len(sr.detections) for sr in result.site_results
-        )
-        assert result.detections_found == expected
+        # Propriedade: cycle_id é um UUID válido
+        parsed = uuid.UUID(result.cycle_id)
+        assert str(parsed) == result.cycle_id

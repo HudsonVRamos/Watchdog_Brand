@@ -1,0 +1,43 @@
+{
+  "$comment": "Configuração da fila SQS e DLQ do Brand Watchdog Worker. Este arquivo serve como referência - a configuração real está no CloudFormation (infra/worker-infrastructure.yml).",
+  "mainQueue": {
+    "queueName": "brand-watchdog-tasks",
+    "attributes": {
+      "VisibilityTimeout": 120,
+      "MessageRetentionPeriod": 1209600,
+      "ReceiveMessageWaitTimeSeconds": 20,
+      "DelaySeconds": 0
+    },
+    "redrivePolicy": {
+      "deadLetterTargetArn": "arn:aws:sqs:us-east-1:{ACCOUNT_ID}:brand-watchdog-dlq",
+      "maxReceiveCount": 3
+    },
+    "description": {
+      "visibilityTimeout": "120s - compatível com timeout de processamento do Worker",
+      "messageRetention": "14 dias - máximo permitido pelo SQS",
+      "longPolling": "20s - reduz custos e melhora latência",
+      "maxReceiveCount": "3 tentativas antes de mover para DLQ"
+    }
+  },
+  "deadLetterQueue": {
+    "queueName": "brand-watchdog-dlq",
+    "attributes": {
+      "VisibilityTimeout": 120,
+      "MessageRetentionPeriod": 1209600
+    },
+    "description": {
+      "purpose": "Armazena mensagens que falharam após 3 tentativas de processamento",
+      "action": "Reprocessamento manual ou investigação de falhas",
+      "retention": "14 dias para permitir investigação e reprocessamento"
+    }
+  },
+  "messageFormat": {
+    "body": {
+      "site_id": "UUID string",
+      "cycle_id": "UUID string",
+      "brand": "sky_plus | dgo",
+      "url": "string (max 2048 chars)",
+      "rule_set_version": "v{timestamp_unix}_{hash_8_chars}"
+    }
+  }
+}

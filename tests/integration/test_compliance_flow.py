@@ -1,9 +1,9 @@
 """Testes de integração para o fluxo completo de compliance.
 
-Exercita o pipeline real: capture → analyze → persist → notify,
-mockando apenas os serviços EXTERNOS (boto3/Bedrock, filesystem,
-email provider). O ComplianceAnalyzer e ComplianceEmailNotifier
-são instanciados reais, validando a integração entre componentes.
+Exercita o pipeline do coordenador distribuído:
+dispatch → publish SQS → consolidate, e testes isolados de
+análise + notificação mockando serviços EXTERNOS (boto3/Bedrock,
+email provider).
 
 Requirements: 1.1, 7.1, 8.1, 9.1
 """
@@ -31,15 +31,16 @@ from brand_watchdog.config import (
     StorageConfig,
 )
 from brand_watchdog.coordinator.coordinator import MonitoringCoordinator
-from brand_watchdog.crawler.crawler import Crawler
+from brand_watchdog.coordinator.cycle_consolidator import CycleConsolidator
 from brand_watchdog.models.dataclasses import (
-    CaptureResult,
     ComplianceReport,
     TargetSite,
 )
+from brand_watchdog.queue.publisher import SQSPublisher
 from brand_watchdog.registry.target_site_manager import TargetSiteManager
 from brand_watchdog.storage.detection_store import DetectionStore
 from brand_watchdog.storage.screenshot_store import ScreenshotStore
+from brand_watchdog.utils.rule_set_version import RuleSetVersionCalculator
 
 
 # --- Resposta mock do Bedrock (todas regras PASS) ---
@@ -230,27 +231,28 @@ def mock_email_provider() -> AsyncMock:
 
 
 @pytest.fixture
-def mock_crawler(tmp_path: Path) -> AsyncMock:
-    """Mock do Crawler que retorna CaptureResult com screenshot fake."""
-    crawler = AsyncMock(spec=Crawler)
-    fake_png = _fake_screenshot_bytes()
+def mock_rule_set_calculator() -> MagicMock:
+    """Mock do RuleSetVersionCalculator."""
+    calculator = MagicMock(spec=RuleSetVersionCalculator)
+    calculator.calculate.return_value = "v1718000000_abcd1234"
+    calculator.has_changed.return_value = False
+    return calculator
 
-    async def capture_side_effect(target_url: str) -> CaptureResult:
-        ref_id = str(uuid.uuid4())
-        path = tmp_path / f"{ref_id}.png"
-        path.write_bytes(fake_png)
-        return CaptureResult(
-            target_url=target_url,
-            screenshot_path=path,
-            screenshot_ref_id=ref_id,
-            captured_at=datetime.now(timezone.utc),
-            page_height_px=3000,
-            was_truncated=False,
-            success=True,
-        )
 
-    crawler.capture = AsyncMock(side_effect=capture_side_effect)
-    return crawler
+@pytest.fixture
+def mock_sqs_publisher() -> AsyncMock:
+    """Mock do SQSPublisher que simula publicação bem-sucedida."""
+    publisher = AsyncMock(spec=SQSPublisher)
+    publisher.publish_all = AsyncMock(return_value=(2, 0))
+    return publisher
+
+
+@pytest.fixture
+def mock_consolidator() -> AsyncMock:
+    """Mock do CycleConsolidator."""
+    consolidator = AsyncMock(spec=CycleConsolidator)
+    consolidator.consolidate = AsyncMock(return_value="completed")
+    return consolidator
 
 
 @pytest.fixture
@@ -306,148 +308,83 @@ class TestComplianceFlowIntegration:
         alert_config: AlertConfig,
         storage_config: StorageConfig,
         app_config: AppConfig,
-        mock_crawler: AsyncMock,
-        mock_detection_store: AsyncMock,
-        mock_screenshot_store: AsyncMock,
+        mock_rule_set_calculator: MagicMock,
+        mock_sqs_publisher: AsyncMock,
+        mock_consolidator: AsyncMock,
         mock_target_site_manager: AsyncMock,
-        mock_email_provider: AsyncMock,
     ) -> None:
-        """Fluxo completo end-to-end com resposta compliant do Bedrock.
+        """Fluxo completo end-to-end do coordenador distribuído.
 
         Verifica que o coordinator:
-        1. Captura screenshots de todos os sites
-        2. Invoca Bedrock via ComplianceAnalyzer (boto3 mockado)
-        3. Não persiste violações (todas regras PASS)
-        4. Envia relatório de compliance por email
+        1. Calcula versão de regras
+        2. Publica mensagens SQS para todos os sites
+        3. Inicia consolidação assíncrona
+        4. Retorna CycleResult com stats corretos
         """
-        # Configura mock do boto3 para retornar resposta compliant
-        boto3_response = _make_boto3_invoke_response(BEDROCK_RESPONSE_ALL_PASS)
+        coordinator = MonitoringCoordinator(
+            rule_set_calculator=mock_rule_set_calculator,
+            sqs_publisher=mock_sqs_publisher,
+            consolidator=mock_consolidator,
+            target_site_manager=mock_target_site_manager,
+            config=app_config,
+        )
 
-        with patch("brand_watchdog.analyzer.bedrock_client.boto3") as mock_boto3:
-            mock_client = MagicMock()
-            mock_client.invoke_model.return_value = boto3_response
-            mock_boto3.client.return_value = mock_client
+        coordinator._create_cycle_record = AsyncMock()
+        coordinator._update_cycle_record = AsyncMock()
+        coordinator._update_cycle_dispatched = AsyncMock()
 
-            # Cria ComplianceAnalyzer REAL com bedrock mockado
-            bedrock_client = BedrockClient(analyzer_config)
-            compliance_analyzer = ComplianceAnalyzer(
-                config=analyzer_config,
-                bedrock_client=bedrock_client,
-                detection_store=mock_detection_store,
-                storage_config=storage_config,
-            )
-
-            # Cria ComplianceEmailNotifier REAL com provider mockado
-            compliance_notifier = ComplianceEmailNotifier(
-                config=alert_config,
-                email_provider=mock_email_provider,
-            )
-
-            coordinator = MonitoringCoordinator(
-                crawler=mock_crawler,
-                compliance_analyzer=compliance_analyzer,
-                compliance_notifier=compliance_notifier,
-                detection_store=mock_detection_store,
-                screenshot_store=mock_screenshot_store,
-                target_site_manager=mock_target_site_manager,
-                config=app_config,
-            )
-
-            # Mocka métodos de banco do coordinator
-            coordinator._create_cycle_record = AsyncMock()
-            coordinator._update_cycle_record = AsyncMock()
-
-            cycle_result = await coordinator.run_cycle()
+        cycle_result = await coordinator.run_cycle()
 
         # Verificações
-        # 1. Captura executada para 2 sites
-        assert mock_crawler.capture.call_count == 2
+        # 1. Versão de regras calculada
+        mock_rule_set_calculator.calculate.assert_called_once()
 
-        # 2. Bedrock invocado para cada site
-        assert mock_client.invoke_model.call_count == 2
+        # 2. Mensagens publicadas na fila SQS (2 sites)
+        mock_sqs_publisher.publish_all.assert_called_once()
+        messages = mock_sqs_publisher.publish_all.call_args[0][0]
+        assert len(messages) == 2
 
-        # 3. Nenhuma violação persistida (todas PASS)
-        mock_detection_store.save.assert_not_called()
-
-        # 4. Email enviado para cada site (2 sites)
-        assert mock_email_provider.send.call_count == 4  # 2 sites × 2 recipients
-
-        # 5. CycleResult correto
+        # 3. CycleResult correto
         assert cycle_result.sites_processed == 2
         assert cycle_result.sites_failed == 0
-        assert len(cycle_result.site_results) == 2
-        for sr in cycle_result.site_results:
-            assert sr.success is True
 
-    async def test_end_to_end_non_compliant_persists_violations(
+    async def test_end_to_end_with_publish_failures(
         self,
         analyzer_config: AnalyzerConfig,
         alert_config: AlertConfig,
         storage_config: StorageConfig,
         app_config: AppConfig,
-        mock_crawler: AsyncMock,
-        mock_detection_store: AsyncMock,
-        mock_screenshot_store: AsyncMock,
+        mock_rule_set_calculator: MagicMock,
+        mock_consolidator: AsyncMock,
         mock_target_site_manager: AsyncMock,
-        mock_email_provider: AsyncMock,
     ) -> None:
-        """Fluxo com regras FAIL: verifica persistência de violações.
+        """Fluxo com falhas de publicação SQS: verifica contagem de falhas.
 
         Verifica que:
-        - DetectionStore.save é chamado para cada regra FAIL
-        - Email é enviado mesmo com status non_compliant
+        - CycleResult reflete sites publicados com sucesso e falhas
+        - Consolidação ainda é iniciada mesmo com falhas parciais
         """
-        boto3_response = _make_boto3_invoke_response(
-            BEDROCK_RESPONSE_WITH_FAILURES
+        # SQS Publisher com 1 sucesso e 1 falha
+        mock_sqs_publisher = AsyncMock(spec=SQSPublisher)
+        mock_sqs_publisher.publish_all = AsyncMock(return_value=(1, 1))
+
+        coordinator = MonitoringCoordinator(
+            rule_set_calculator=mock_rule_set_calculator,
+            sqs_publisher=mock_sqs_publisher,
+            consolidator=mock_consolidator,
+            target_site_manager=mock_target_site_manager,
+            config=app_config,
         )
 
-        with patch("brand_watchdog.analyzer.bedrock_client.boto3") as mock_boto3:
-            mock_client = MagicMock()
-            mock_client.invoke_model.return_value = boto3_response
-            mock_boto3.client.return_value = mock_client
+        coordinator._create_cycle_record = AsyncMock()
+        coordinator._update_cycle_record = AsyncMock()
+        coordinator._update_cycle_dispatched = AsyncMock()
 
-            bedrock_client = BedrockClient(analyzer_config)
-            compliance_analyzer = ComplianceAnalyzer(
-                config=analyzer_config,
-                bedrock_client=bedrock_client,
-                detection_store=mock_detection_store,
-                storage_config=storage_config,
-            )
+        cycle_result = await coordinator.run_cycle()
 
-            compliance_notifier = ComplianceEmailNotifier(
-                config=alert_config,
-                email_provider=mock_email_provider,
-            )
-
-            coordinator = MonitoringCoordinator(
-                crawler=mock_crawler,
-                compliance_analyzer=compliance_analyzer,
-                compliance_notifier=compliance_notifier,
-                detection_store=mock_detection_store,
-                screenshot_store=mock_screenshot_store,
-                target_site_manager=mock_target_site_manager,
-                config=app_config,
-            )
-
-            coordinator._create_cycle_record = AsyncMock()
-            coordinator._update_cycle_record = AsyncMock()
-
-            cycle_result = await coordinator.run_cycle()
-
-        # 2 regras FAIL × 2 sites = 4 chamadas ao DetectionStore.save
-        assert mock_detection_store.save.call_count == 4
-
-        # Verifica que os rule_ids persistidos estão corretos
-        saved_rule_ids = [
-            call.kwargs["detection"].match_type
-            for call in mock_detection_store.save.call_args_list
-        ]
-        assert saved_rule_ids.count("facilitator_role") == 2
-        assert saved_rule_ids.count("logo_application") == 2
-
-        # Email enviado para todos os sites (mesmo non_compliant)
-        assert mock_email_provider.send.call_count == 4  # 2 sites × 2 recipients
-        assert cycle_result.sites_processed == 2
+        # CycleResult reflete falha parcial
+        assert cycle_result.sites_processed == 1
+        assert cycle_result.sites_failed == 1
 
 
     async def test_bedrock_client_invoked_with_correct_payload(
@@ -586,116 +523,41 @@ class TestComplianceFlowIntegration:
         assert "facilitator_role" in body
         assert "NON_COMPLIANT" in body
 
-    async def test_error_isolation_one_site_fails_others_continue(
+    async def test_coordinator_skips_when_cycle_running(
         self,
-        analyzer_config: AnalyzerConfig,
-        alert_config: AlertConfig,
-        storage_config: StorageConfig,
         app_config: AppConfig,
-        mock_detection_store: AsyncMock,
-        mock_screenshot_store: AsyncMock,
-        mock_email_provider: AsyncMock,
-        tmp_path: Path,
+        mock_rule_set_calculator: MagicMock,
+        mock_sqs_publisher: AsyncMock,
+        mock_consolidator: AsyncMock,
+        mock_target_site_manager: AsyncMock,
     ) -> None:
-        """Se um site falha, os demais continuam sendo processados.
+        """Se um ciclo já está em execução, o novo é pulado.
 
-        Simula falha no Bedrock para o primeiro site e resposta
-        válida para o segundo. Verifica que:
-        - Primeiro site retorna success=False
-        - Segundo site é processado normalmente
-        - Email enviado apenas para o site com sucesso
+        Verifica que:
+        - Segundo ciclo retorna sites_processed=0
+        - SQS Publisher não é chamado no ciclo pulado
         """
-        sites = _make_target_sites(2)
-        target_site_manager = AsyncMock(spec=TargetSiteManager)
-        target_site_manager.list_all = AsyncMock(return_value=sites)
+        coordinator = MonitoringCoordinator(
+            rule_set_calculator=mock_rule_set_calculator,
+            sqs_publisher=mock_sqs_publisher,
+            consolidator=mock_consolidator,
+            target_site_manager=mock_target_site_manager,
+            config=app_config,
+        )
 
-        # Crawler que funciona para ambos os sites
-        fake_png = _fake_screenshot_bytes()
-        crawler = AsyncMock(spec=Crawler)
+        coordinator._create_cycle_record = AsyncMock()
+        coordinator._update_cycle_record = AsyncMock()
+        coordinator._update_cycle_dispatched = AsyncMock()
 
-        async def capture_ok(target_url: str) -> CaptureResult:
-            ref_id = str(uuid.uuid4())
-            path = tmp_path / f"{ref_id}.png"
-            path.write_bytes(fake_png)
-            return CaptureResult(
-                target_url=target_url,
-                screenshot_path=path,
-                screenshot_ref_id=ref_id,
-                captured_at=datetime.now(timezone.utc),
-                page_height_px=2500,
-                was_truncated=False,
-                success=True,
-            )
+        # Simula ciclo já em execução
+        coordinator._cycle_running = True
 
-        crawler.capture = AsyncMock(side_effect=capture_ok)
+        cycle_result = await coordinator.run_cycle()
 
-        # Bedrock falha para o primeiro site (todas tentativas),
-        # sucesso para o segundo site.
-        # O retry do tenacity faz 3 tentativas — precisamos falhar todas 3
-        # para o site 1 e retornar ok para o site 2.
-        boto3_response_ok = _make_boto3_invoke_response(BEDROCK_RESPONSE_ALL_PASS)
-        call_count = {"n": 0}
-
-        def invoke_model_side_effect(**kwargs):
-            from botocore.exceptions import ClientError
-
-            call_count["n"] += 1
-            # Primeiras 3 chamadas são retries do site 1 → todas falham
-            if call_count["n"] <= 3:
-                raise ClientError(
-                    {"Error": {"Code": "ThrottlingException", "Message": "Rate exceeded"}},
-                    "InvokeModel",
-                )
-            # Chamadas seguintes (site 2) → sucesso
-            return boto3_response_ok
-
-        with patch("brand_watchdog.analyzer.bedrock_client.boto3") as mock_boto3:
-            mock_client = MagicMock()
-            mock_client.invoke_model.side_effect = invoke_model_side_effect
-            mock_boto3.client.return_value = mock_client
-
-            bedrock_client = BedrockClient(analyzer_config)
-            compliance_analyzer = ComplianceAnalyzer(
-                config=analyzer_config,
-                bedrock_client=bedrock_client,
-                detection_store=mock_detection_store,
-                storage_config=storage_config,
-            )
-
-            compliance_notifier = ComplianceEmailNotifier(
-                config=alert_config,
-                email_provider=mock_email_provider,
-            )
-
-            coordinator = MonitoringCoordinator(
-                crawler=crawler,
-                compliance_analyzer=compliance_analyzer,
-                compliance_notifier=compliance_notifier,
-                detection_store=mock_detection_store,
-                screenshot_store=mock_screenshot_store,
-                target_site_manager=target_site_manager,
-                config=app_config,
-            )
-
-            coordinator._create_cycle_record = AsyncMock()
-            coordinator._update_cycle_record = AsyncMock()
-
-            cycle_result = await coordinator.run_cycle()
-
-        # Primeiro site falhou, segundo teve sucesso
-        assert cycle_result.sites_processed == 1
-        assert cycle_result.sites_failed == 1
-        assert len(cycle_result.site_results) == 2
-
-        # Verifica isolamento: site com falha e site com sucesso
-        failed_sites = [sr for sr in cycle_result.site_results if not sr.success]
-        success_sites = [sr for sr in cycle_result.site_results if sr.success]
-        assert len(failed_sites) == 1
-        assert len(success_sites) == 1
-        assert failed_sites[0].error_message is not None
-
-        # Email enviado apenas para o site com sucesso (2 recipients)
-        assert mock_email_provider.send.call_count == 2
+        # Ciclo pulado
+        assert cycle_result.sites_processed == 0
+        assert cycle_result.sites_failed == 0
+        mock_sqs_publisher.publish_all.assert_not_called()
 
 
     async def test_detection_store_save_called_with_correct_fields(

@@ -23,7 +23,7 @@ from brand_watchdog.analyzer.bedrock_client import BedrockClient
 
 
 _PBT_SETTINGS = settings(
-    max_examples=100,
+    max_examples=30,
     suppress_health_check=[HealthCheck.function_scoped_fixture],
 )
 

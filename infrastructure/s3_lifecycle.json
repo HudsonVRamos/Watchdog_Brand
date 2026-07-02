@@ -1,0 +1,26 @@
+{
+  "$comment": "Configuração de lifecycle rule do S3 para screenshots. Este arquivo serve como referência - a configuração real está no CloudFormation (infra/cloudformation.yml e infra/worker-infrastructure.yml).",
+  "bucket": "brand-watchdog-screenshots-{ACCOUNT_ID}",
+  "lifecycleConfiguration": {
+    "rules": [
+      {
+        "id": "ExpireScreenshots",
+        "status": "Enabled",
+        "filter": {
+          "prefix": "screenshots/"
+        },
+        "expiration": {
+          "days": 90
+        },
+        "description": "Expira screenshots após 90 dias para controle de custos de armazenamento"
+      }
+    ]
+  },
+  "keyFormat": "screenshots/{cycle_id}/{screenshot_id}.png",
+  "notes": {
+    "retention": "90 dias padrão, configurável via parâmetro ScreenshotRetentionDays",
+    "durability": "S3 oferece 99.999999999% (11 noves) de durabilidade",
+    "encryption": "SSE-S3 (server-side encryption) habilitado por padrão",
+    "publicAccess": "Bloqueado via PublicAccessBlockConfiguration"
+  }
+}

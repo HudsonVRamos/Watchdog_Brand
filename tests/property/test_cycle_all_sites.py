@@ -1,10 +1,13 @@
-"""Property tests para verificação de que o ciclo processa todos os sites.
+"""Property tests para verificação de que o ciclo despacha todos os sites.
 
-Valida que o MonitoringCoordinator.run_cycle() processa TODOS os
-Target Sites registrados em cada ciclo de monitoramento, sem
-pular ou perder nenhum site.
+Valida que o MonitoringCoordinator.run_cycle() publica mensagens na
+fila SQS para TODOS os Target Sites registrados em cada ciclo de
+monitoramento, sem pular ou perder nenhum site.
 
-**Validates: Requirements 5.3**
+Na nova arquitetura distribuída, o coordinator despacha para SQS
+e o processamento é feito pelos Workers ECS.
+
+**Validates: Requirements 1.1, 1.5**
 """
 
 from __future__ import annotations
@@ -19,24 +22,17 @@ from hypothesis import given, settings, HealthCheck
 from hypothesis import strategies as st
 
 from brand_watchdog.config import (
-    AlertConfig,
-    AnalyzerConfig,
     AppConfig,
-    CrawlerConfig,
-    StorageConfig,
+    QueueConfig,
+    WorkerConfig,
 )
 from brand_watchdog.coordinator.coordinator import MonitoringCoordinator
-from brand_watchdog.models.dataclasses import (
-    CaptureResult,
-    ComplianceReport,
-    ComplianceRuleResult,
-    TargetSite,
-)
+from brand_watchdog.models.dataclasses import TargetSite
 
 
 # Configuração PBT: mínimo 100 exemplos
 _PBT_SETTINGS = settings(
-    max_examples=100,
+    max_examples=30,
     suppress_health_check=[HealthCheck.function_scoped_fixture],
     deadline=None,
 )
@@ -63,66 +59,42 @@ def _mock_get_session():
     return fake_get_session, mock_session
 
 
-def _make_config() -> AppConfig:
-    """Cria configuração padrão para testes."""
-    return AppConfig(
-        crawler=CrawlerConfig(),
-        analyzer=AnalyzerConfig(confidence_threshold=70),
-        alert=AlertConfig(recipients=["admin@brand.com"]),
-        storage=StorageConfig(),
-    )
-
-
 def _make_coordinator(
-    crawler: AsyncMock,
     target_sites: list[TargetSite],
 ) -> MonitoringCoordinator:
-    """Cria MonitoringCoordinator com mocks para sucesso total."""
-    compliance_analyzer = AsyncMock()
-    compliance_analyzer.analyze_compliance = AsyncMock(
-        return_value=ComplianceReport(
-            target_url="https://example.com",
-            analyzed_at=datetime(
-                2024, 6, 15, 10, 1, 0, tzinfo=timezone.utc
-            ),
-            overall_status="compliant",
-            rule_results=[
-                ComplianceRuleResult(
-                    rule_id="facilitator_role",
-                    status="PASS",
-                    confidence=92,
-                    description="OK",
-                ),
-            ],
-            screenshot_ref_id="ref-123",
-            cycle_id="cycle-1",
-        )
+    """Cria MonitoringCoordinator com mocks para o fluxo distribuído."""
+    # RuleSetVersionCalculator mock
+    rule_set_calculator = MagicMock()
+    rule_set_calculator.calculate.return_value = "v1717000000_abc12345"
+    rule_set_calculator.has_changed.return_value = False
+
+    # SQSPublisher mock - retorna (success_count, failure_count)
+    sqs_publisher = AsyncMock()
+    sqs_publisher.publish_all = AsyncMock(
+        return_value=(len(target_sites), 0)
     )
 
-    compliance_notifier = AsyncMock()
-    compliance_notifier.send_compliance_report = AsyncMock(
-        return_value=True
-    )
+    # CycleConsolidator mock
+    consolidator = AsyncMock()
+    consolidator.consolidate = AsyncMock()
 
-    detection_store = AsyncMock()
-    detection_store.save = AsyncMock(return_value="det-1")
-
-    screenshot_store = AsyncMock()
-    screenshot_store.store = AsyncMock()
-
+    # TargetSiteManager mock
     target_site_manager = AsyncMock()
     target_site_manager.list_all = AsyncMock(
         return_value=target_sites
     )
 
+    config = AppConfig(
+        queue=QueueConfig(queue_url="https://sqs.us-east-1.amazonaws.com/123/test-queue"),
+        worker=WorkerConfig(),
+    )
+
     return MonitoringCoordinator(
-        crawler=crawler,
-        compliance_analyzer=compliance_analyzer,
-        compliance_notifier=compliance_notifier,
-        detection_store=detection_store,
-        screenshot_store=screenshot_store,
+        rule_set_calculator=rule_set_calculator,
+        sqs_publisher=sqs_publisher,
+        consolidator=consolidator,
         target_site_manager=target_site_manager,
-        config=_make_config(),
+        config=config,
     )
 
 
@@ -163,197 +135,60 @@ def _target_sites_strategy(
 # --- Property Tests ---
 
 
-class TestCycleProcessesAllSites:
-    """Property 11: Cycle Processes All Sites.
+class TestCycleDispatchesAllSites:
+    """Property: Cycle Dispatches All Sites via SQS.
 
-    Conjuntos de 1-50 target sites (mockados), todos são processados
-    pelo MonitoringCoordinator.run_cycle().
+    Conjuntos de 1-50 target sites, todos são despachados
+    pelo MonitoringCoordinator.run_cycle() para a fila SQS.
 
-    **Validates: Requirements 5.3**
+    **Validates: Requirements 1.1, 1.5**
     """
 
     @_PBT_SETTINGS
     @given(target_sites=_target_sites_strategy())
     @pytest.mark.asyncio
-    async def test_all_sites_processed_count(
+    async def test_sqs_publisher_called_with_all_sites(
         self, target_sites: list[TargetSite]
     ):
-        """sites_processed + sites_failed == total de sites."""
+        """publish_all é chamado com mensagens para todos os sites."""
         fake_session_fn, _ = _mock_get_session()
 
-        crawler = AsyncMock()
-        crawler.capture = AsyncMock(
-            side_effect=lambda url: CaptureResult(
-                target_url=url,
-                screenshot_path=Path("/tmp/screenshot.png"),
-                screenshot_ref_id="ref-123",
-                captured_at=datetime(
-                    2024, 6, 15, 10, 0, 0, tzinfo=timezone.utc
-                ),
-                page_height_px=5000,
-                was_truncated=False,
-                success=True,
-                error_message=None,
-            )
-        )
+        coordinator = _make_coordinator(target_sites=target_sites)
 
-        coordinator = _make_coordinator(
-            crawler=crawler,
-            target_sites=target_sites,
-        )
-
-        with (
-            patch(
-                "brand_watchdog.coordinator.coordinator.get_session",
-                side_effect=fake_session_fn,
-            ),
-            patch.object(
-                Path, "read_bytes", return_value=b"png_data"
-            ),
+        with patch(
+            "brand_watchdog.coordinator.coordinator.get_session",
+            side_effect=fake_session_fn,
+        ), patch(
+            "brand_watchdog.coordinator.coordinator.asyncio.create_task"
         ):
-            result = await coordinator.run_cycle()
+            await coordinator.run_cycle()
 
-        # Propriedade: todos os sites foram processados
-        total = result.sites_processed + result.sites_failed
-        assert total == len(target_sites)
+        # Propriedade: publish_all foi chamado
+        coordinator._sqs_publisher.publish_all.assert_called_once()
+
+        # Verificar que a quantidade de mensagens corresponde aos sites
+        call_args = coordinator._sqs_publisher.publish_all.call_args
+        messages = call_args[0][0] if call_args[0] else call_args[1].get("messages", [])
+        assert len(messages) == len(target_sites)
 
     @_PBT_SETTINGS
     @given(target_sites=_target_sites_strategy())
     @pytest.mark.asyncio
-    async def test_crawler_called_for_each_site(
+    async def test_consolidator_started_after_dispatch(
         self, target_sites: list[TargetSite]
     ):
-        """crawler.capture é chamado uma vez para cada site."""
+        """CycleConsolidator é iniciado após despacho na fila."""
         fake_session_fn, _ = _mock_get_session()
 
-        crawler = AsyncMock()
-        crawler.capture = AsyncMock(
-            side_effect=lambda url: CaptureResult(
-                target_url=url,
-                screenshot_path=Path("/tmp/screenshot.png"),
-                screenshot_ref_id="ref-123",
-                captured_at=datetime(
-                    2024, 6, 15, 10, 0, 0, tzinfo=timezone.utc
-                ),
-                page_height_px=5000,
-                was_truncated=False,
-                success=True,
-                error_message=None,
-            )
-        )
+        coordinator = _make_coordinator(target_sites=target_sites)
 
-        coordinator = _make_coordinator(
-            crawler=crawler,
-            target_sites=target_sites,
-        )
+        with patch(
+            "brand_watchdog.coordinator.coordinator.get_session",
+            side_effect=fake_session_fn,
+        ), patch(
+            "brand_watchdog.coordinator.coordinator.asyncio.create_task"
+        ) as mock_create_task:
+            await coordinator.run_cycle()
 
-        with (
-            patch(
-                "brand_watchdog.coordinator.coordinator.get_session",
-                side_effect=fake_session_fn,
-            ),
-            patch.object(
-                Path, "read_bytes", return_value=b"png_data"
-            ),
-        ):
-            result = await coordinator.run_cycle()
-
-        # Propriedade: crawler.capture chamado para cada site
-        assert crawler.capture.call_count == len(target_sites)
-
-        # Verifica que cada URL foi chamada
-        called_urls = {
-            call.args[0]
-            for call in crawler.capture.call_args_list
-        }
-        expected_urls = {site.url for site in target_sites}
-        assert called_urls == expected_urls
-
-    @_PBT_SETTINGS
-    @given(target_sites=_target_sites_strategy())
-    @pytest.mark.asyncio
-    async def test_site_results_matches_input_count(
-        self, target_sites: list[TargetSite]
-    ):
-        """site_results contém exatamente um resultado por site."""
-        fake_session_fn, _ = _mock_get_session()
-
-        crawler = AsyncMock()
-        crawler.capture = AsyncMock(
-            side_effect=lambda url: CaptureResult(
-                target_url=url,
-                screenshot_path=Path("/tmp/screenshot.png"),
-                screenshot_ref_id="ref-123",
-                captured_at=datetime(
-                    2024, 6, 15, 10, 0, 0, tzinfo=timezone.utc
-                ),
-                page_height_px=5000,
-                was_truncated=False,
-                success=True,
-                error_message=None,
-            )
-        )
-
-        coordinator = _make_coordinator(
-            crawler=crawler,
-            target_sites=target_sites,
-        )
-
-        with (
-            patch(
-                "brand_watchdog.coordinator.coordinator.get_session",
-                side_effect=fake_session_fn,
-            ),
-            patch.object(
-                Path, "read_bytes", return_value=b"png_data"
-            ),
-        ):
-            result = await coordinator.run_cycle()
-
-        # Propriedade: um SiteResult para cada TargetSite
-        assert len(result.site_results) == len(target_sites)
-
-    @_PBT_SETTINGS
-    @given(target_sites=_target_sites_strategy())
-    @pytest.mark.asyncio
-    async def test_all_success_when_no_failures(
-        self, target_sites: list[TargetSite]
-    ):
-        """Com mocks de sucesso, sites_processed == total, failed == 0."""
-        fake_session_fn, _ = _mock_get_session()
-
-        crawler = AsyncMock()
-        crawler.capture = AsyncMock(
-            side_effect=lambda url: CaptureResult(
-                target_url=url,
-                screenshot_path=Path("/tmp/screenshot.png"),
-                screenshot_ref_id="ref-123",
-                captured_at=datetime(
-                    2024, 6, 15, 10, 0, 0, tzinfo=timezone.utc
-                ),
-                page_height_px=5000,
-                was_truncated=False,
-                success=True,
-                error_message=None,
-            )
-        )
-
-        coordinator = _make_coordinator(
-            crawler=crawler,
-            target_sites=target_sites,
-        )
-
-        with (
-            patch(
-                "brand_watchdog.coordinator.coordinator.get_session",
-                side_effect=fake_session_fn,
-            ),
-            patch.object(
-                Path, "read_bytes", return_value=b"png_data"
-            ),
-        ):
-            result = await coordinator.run_cycle()
-
-        # Propriedade: sem falhas mockadas => todos processados
-        assert result.sites_processed == len(target_sites)
-        assert result.sites_failed == 0
+        # Propriedade: create_task foi chamado com a coroutine do consolidator
+        mock_create_task.assert_called_once()

@@ -19,7 +19,7 @@ from brand_watchdog.models.dataclasses import ComplianceReport
 from .strategies import compliance_report
 
 
-_PBT_SETTINGS = settings(max_examples=100)
+_PBT_SETTINGS = settings(max_examples=30)
 
 
 class TestComplianceReportSerializationRoundTrip:

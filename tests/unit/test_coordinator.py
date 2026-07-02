@@ -1,14 +1,15 @@
-"""Testes unitários para o MonitoringCoordinator (compliance).
+"""Testes unitários para o MonitoringCoordinator (distribuído).
 
 Valida:
-- Ciclo completo com sucesso (capture → analyze_compliance → notify)
+- Ciclo completo com despacho via SQS
 - Lock de ciclo: pula execução se ciclo anterior em andamento
 - Concurrent cycle skip: dois ciclos simultâneos, segundo é pulado
-- Processamento de múltiplos sites com isolamento de falha
+- Integração com RuleSetVersionCalculator
+- Integração com SQSPublisher
+- Integração com CycleConsolidator
 - Registro e atualização de MonitoringCycleModel no banco
-- Stats update: create + update com dados corretos
-- Múltiplos sites com contagem mista sucesso/falha
-- Envio de email sempre (compliant ou non_compliant)
+- Aborto do ciclo quando diretório de regras está vazio/inacessível
+- Log de mudança de versão de regras
 """
 
 from __future__ import annotations
@@ -22,18 +23,21 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from brand_watchdog.config import (
-    AlertConfig,
-    AnalyzerConfig,
     AppConfig,
-    CrawlerConfig,
-    StorageConfig,
+    QueueConfig,
+    WorkerConfig,
 )
-from brand_watchdog.coordinator.coordinator import MonitoringCoordinator
-from brand_watchdog.models.dataclasses import (
-    CaptureResult,
-    ComplianceReport,
-    ComplianceRuleResult,
-    TargetSite,
+from brand_watchdog.coordinator.coordinator import (
+    MonitoringCoordinator,
+)
+from brand_watchdog.coordinator.cycle_consolidator import (
+    CycleConsolidator,
+)
+from brand_watchdog.models.dataclasses import TargetSite
+from brand_watchdog.queue.publisher import SQSPublisher
+from brand_watchdog.utils.rule_set_version import (
+    RuleSetDirectoryError,
+    RuleSetVersionCalculator,
 )
 
 
@@ -74,154 +78,121 @@ def _make_target_site(
     )
 
 
-def _make_capture_result(
-    target_url: str = "https://example.com",
-    success: bool = True,
-) -> CaptureResult:
-    return CaptureResult(
-        target_url=target_url,
-        screenshot_path=Path("/tmp/screenshot.png"),
-        screenshot_ref_id="ref-123",
-        captured_at=datetime(2024, 6, 15, 10, 0, 0, tzinfo=timezone.utc),
-        page_height_px=5000,
-        was_truncated=False,
-        success=success,
-        error_message=None if success else "Timeout ao capturar",
-    )
-
-
-def _make_compliance_report(
-    target_url: str = "https://example.com",
-    overall_status: str = "compliant",
-    fail_count: int = 0,
-) -> ComplianceReport:
-    """Cria um ComplianceReport para testes."""
-    rules = []
-    rule_names = [
-        "facilitator_role", "logo_application",
-        "logo_effects", "content_separation",
-        "naming_pricing", "kv_integrity",
-    ]
-    for i, name in enumerate(rule_names):
-        if i < fail_count:
-            rules.append(ComplianceRuleResult(
-                rule_id=name,
-                status="FAIL",
-                confidence=85,
-                description=f"Violação em {name}",
-            ))
-        else:
-            rules.append(ComplianceRuleResult(
-                rule_id=name,
-                status="PASS",
-                confidence=92,
-                description=f"Regra {name} aprovada",
-            ))
-    return ComplianceReport(
-        target_url=target_url,
-        analyzed_at=datetime(2024, 6, 15, 10, 1, 0, tzinfo=timezone.utc),
-        overall_status=overall_status,
-        rule_results=rules,
-        screenshot_ref_id="ref-123",
-        cycle_id="cycle-1",
-    )
-
-
-def _make_config(
-    recipients: list[str] | None = None,
-) -> AppConfig:
-    if recipients is None:
-        recipients = ["admin@brand.com"]
+def _make_config() -> AppConfig:
     return AppConfig(
-        crawler=CrawlerConfig(),
-        analyzer=AnalyzerConfig(),
-        alert=AlertConfig(recipients=recipients),
-        storage=StorageConfig(),
+        queue=QueueConfig(
+            queue_url="https://sqs.us-east-1.amazonaws.com/test",
+            publish_timeout_minutes=5,
+        ),
+        worker=WorkerConfig(
+            consolidation_poll_interval_seconds=30,
+            consolidation_timeout_minutes=60,
+        ),
     )
 
 
 def _make_coordinator(
-    crawler: AsyncMock | None = None,
-    compliance_analyzer: AsyncMock | None = None,
-    compliance_notifier: AsyncMock | None = None,
-    detection_store: AsyncMock | None = None,
-    screenshot_store: AsyncMock | None = None,
+    rule_set_calculator: MagicMock | None = None,
+    sqs_publisher: AsyncMock | None = None,
+    consolidator: AsyncMock | None = None,
     target_site_manager: AsyncMock | None = None,
     config: AppConfig | None = None,
 ) -> MonitoringCoordinator:
-    """Cria um MonitoringCoordinator com mocks para testes."""
-    _crawler = crawler or AsyncMock()
-    _compliance_analyzer = compliance_analyzer or AsyncMock()
-    _compliance_notifier = compliance_notifier or AsyncMock()
-    _detection_store = detection_store or AsyncMock()
-    _screenshot_store = screenshot_store or AsyncMock()
-    _target_site_manager = target_site_manager or AsyncMock()
+    """Cria MonitoringCoordinator com mocks para testes."""
+    if rule_set_calculator is None:
+        rule_set_calculator = MagicMock(
+            spec=RuleSetVersionCalculator
+        )
+        rule_set_calculator.calculate.return_value = (
+            "v1719849600_a3b2c1d4"
+        )
+        rule_set_calculator.has_changed.return_value = False
+
+    if sqs_publisher is None:
+        sqs_publisher = AsyncMock(spec=SQSPublisher)
+        sqs_publisher.publish_all = AsyncMock(
+            return_value=(1, 0)
+        )
+
+    if consolidator is None:
+        consolidator = AsyncMock(spec=CycleConsolidator)
+        consolidator.consolidate = AsyncMock(
+            return_value="completed"
+        )
+
+    if target_site_manager is None:
+        target_site_manager = AsyncMock()
+        target_site_manager.list_all = AsyncMock(
+            return_value=[_make_target_site()]
+        )
+
     _config = config or _make_config()
 
     return MonitoringCoordinator(
-        crawler=_crawler,
-        compliance_analyzer=_compliance_analyzer,
-        compliance_notifier=_compliance_notifier,
-        detection_store=_detection_store,
-        screenshot_store=_screenshot_store,
-        target_site_manager=_target_site_manager,
+        rule_set_calculator=rule_set_calculator,
+        sqs_publisher=sqs_publisher,
+        consolidator=consolidator,
+        target_site_manager=target_site_manager,
         config=_config,
     )
 
 
-# --- Testes de Ciclo Completo ---
+# --- Testes de Ciclo Completo com Despacho ---
 
 
 @pytest.mark.asyncio
 @patch("brand_watchdog.coordinator.coordinator.get_session")
-async def test_run_cycle_success(mock_get_session_patch):
-    """Ciclo completo processa site com sucesso via compliance."""
+async def test_run_cycle_dispatches_to_sqs(
+    mock_get_session_patch,
+):
+    """Ciclo completo despacha mensagens na fila SQS."""
     fake_session_fn, mock_session = _mock_get_session()
     mock_get_session_patch.side_effect = fake_session_fn
 
-    target_sites = [_make_target_site()]
-    capture = _make_capture_result()
-    report = _make_compliance_report()
-
-    crawler = AsyncMock()
-    crawler.capture = AsyncMock(return_value=capture)
-
-    compliance_analyzer = AsyncMock()
-    compliance_analyzer.analyze_compliance = AsyncMock(
-        return_value=report
-    )
-
-    compliance_notifier = AsyncMock()
-    compliance_notifier.send_compliance_report = AsyncMock(
-        return_value=True
-    )
-
-    screenshot_store = AsyncMock()
-    screenshot_store.store = AsyncMock()
+    target_sites = [
+        _make_target_site(
+            url="https://a.com", site_id="s1"
+        ),
+        _make_target_site(
+            url="https://b.com", site_id="s2", brand="dgo"
+        ),
+    ]
 
     target_site_manager = AsyncMock()
     target_site_manager.list_all = AsyncMock(
         return_value=target_sites
     )
 
-    with patch.object(Path, "read_bytes", return_value=b"png_data"):
-        coordinator = _make_coordinator(
-            crawler=crawler,
-            compliance_analyzer=compliance_analyzer,
-            compliance_notifier=compliance_notifier,
-            screenshot_store=screenshot_store,
-            target_site_manager=target_site_manager,
-        )
+    sqs_publisher = AsyncMock(spec=SQSPublisher)
+    sqs_publisher.publish_all = AsyncMock(
+        return_value=(2, 0)
+    )
 
-        result = await coordinator.run_cycle()
+    consolidator = AsyncMock(spec=CycleConsolidator)
+    consolidator.consolidate = AsyncMock(
+        return_value="completed"
+    )
 
-    assert result.sites_processed == 1
+    coordinator = _make_coordinator(
+        target_site_manager=target_site_manager,
+        sqs_publisher=sqs_publisher,
+        consolidator=consolidator,
+    )
+
+    result = await coordinator.run_cycle()
+
+    assert result.sites_processed == 2
     assert result.sites_failed == 0
-    assert len(result.site_results) == 1
-    assert result.site_results[0].success is True
-    crawler.capture.assert_called_once_with("https://example.com")
-    compliance_analyzer.analyze_compliance.assert_called_once()
-    compliance_notifier.send_compliance_report.assert_called_once()
+    sqs_publisher.publish_all.assert_called_once()
+
+    # Verificar mensagens publicadas
+    call_args = sqs_publisher.publish_all.call_args
+    messages = call_args[0][0]
+    assert len(messages) == 2
+    assert messages[0].site_id == "s1"
+    assert messages[0].brand == "sky_plus"
+    assert messages[1].site_id == "s2"
+    assert messages[1].brand == "dgo"
 
 
 # --- Testes de Lock de Ciclo ---
@@ -247,270 +218,292 @@ async def test_run_cycle_skipped_when_already_running(
     assert result.site_results == []
 
 
-# --- Testes de Falha Isolada por Site ---
+# --- Testes de RuleSetVersionCalculator ---
 
 
 @pytest.mark.asyncio
 @patch("brand_watchdog.coordinator.coordinator.get_session")
-async def test_site_failure_does_not_stop_cycle(mock_get_session_patch):
-    """Falha em um site não interrompe processamento dos demais."""
-    fake_session_fn, mock_session = _mock_get_session()
-    mock_get_session_patch.side_effect = fake_session_fn
-
-    site_ok = _make_target_site(url="https://ok.com", site_id="s1")
-    site_fail = _make_target_site(
-        url="https://fail.com", site_id="s2"
-    )
-    target_sites = [site_fail, site_ok]
-
-    capture_ok = _make_capture_result(target_url="https://ok.com")
-    capture_fail = _make_capture_result(
-        target_url="https://fail.com", success=False
-    )
-    report = _make_compliance_report(target_url="https://ok.com")
-
-    crawler = AsyncMock()
-    crawler.capture = AsyncMock(
-        side_effect=[capture_fail, capture_ok]
-    )
-
-    compliance_analyzer = AsyncMock()
-    compliance_analyzer.analyze_compliance = AsyncMock(
-        return_value=report
-    )
-
-    compliance_notifier = AsyncMock()
-    compliance_notifier.send_compliance_report = AsyncMock(
-        return_value=True
-    )
-
-    screenshot_store = AsyncMock()
-    screenshot_store.store = AsyncMock()
-
-    target_site_manager = AsyncMock()
-    target_site_manager.list_all = AsyncMock(
-        return_value=target_sites
-    )
-
-    with patch.object(Path, "read_bytes", return_value=b"png_data"):
-        coordinator = _make_coordinator(
-            crawler=crawler,
-            compliance_analyzer=compliance_analyzer,
-            compliance_notifier=compliance_notifier,
-            screenshot_store=screenshot_store,
-            target_site_manager=target_site_manager,
-        )
-
-        result = await coordinator.run_cycle()
-
-    assert result.sites_processed == 1
-    assert result.sites_failed == 1
-    assert len(result.site_results) == 2
-
-
-@pytest.mark.asyncio
-@patch("brand_watchdog.coordinator.coordinator.get_session")
-async def test_site_exception_is_isolated(mock_get_session_patch):
-    """Exceção em um site é capturada sem afetar os demais."""
-    fake_session_fn, mock_session = _mock_get_session()
-    mock_get_session_patch.side_effect = fake_session_fn
-
-    site1 = _make_target_site(url="https://error.com", site_id="s1")
-    site2 = _make_target_site(url="https://ok.com", site_id="s2")
-    target_sites = [site1, site2]
-    report = _make_compliance_report(target_url="https://ok.com")
-
-    crawler = AsyncMock()
-    capture_ok = _make_capture_result(target_url="https://ok.com")
-    crawler.capture = AsyncMock(
-        side_effect=[RuntimeError("Erro inesperado"), capture_ok]
-    )
-
-    compliance_analyzer = AsyncMock()
-    compliance_analyzer.analyze_compliance = AsyncMock(
-        return_value=report
-    )
-
-    compliance_notifier = AsyncMock()
-    compliance_notifier.send_compliance_report = AsyncMock(
-        return_value=True
-    )
-
-    screenshot_store = AsyncMock()
-    screenshot_store.store = AsyncMock()
-
-    target_site_manager = AsyncMock()
-    target_site_manager.list_all = AsyncMock(
-        return_value=target_sites
-    )
-
-    with patch.object(Path, "read_bytes", return_value=b"png_data"):
-        coordinator = _make_coordinator(
-            crawler=crawler,
-            compliance_analyzer=compliance_analyzer,
-            compliance_notifier=compliance_notifier,
-            screenshot_store=screenshot_store,
-            target_site_manager=target_site_manager,
-        )
-
-        result = await coordinator.run_cycle()
-
-    assert result.sites_processed == 1
-    assert result.sites_failed == 1
-    assert result.site_results[0].success is False
-    assert "Erro inesperado" in result.site_results[0].error_message
-    assert result.site_results[1].success is True
-
-
-# --- Testes de Envio de Email Sempre ---
-
-
-@pytest.mark.asyncio
-@patch("brand_watchdog.coordinator.coordinator.get_session")
-async def test_email_sent_for_compliant_report(mock_get_session_patch):
-    """Email é enviado mesmo quando relatório é compliant."""
-    fake_session_fn, mock_session = _mock_get_session()
-    mock_get_session_patch.side_effect = fake_session_fn
-
-    target_sites = [_make_target_site()]
-    capture = _make_capture_result()
-    report = _make_compliance_report(overall_status="compliant")
-
-    crawler = AsyncMock()
-    crawler.capture = AsyncMock(return_value=capture)
-
-    compliance_analyzer = AsyncMock()
-    compliance_analyzer.analyze_compliance = AsyncMock(
-        return_value=report
-    )
-
-    compliance_notifier = AsyncMock()
-    compliance_notifier.send_compliance_report = AsyncMock(
-        return_value=True
-    )
-
-    screenshot_store = AsyncMock()
-    screenshot_store.store = AsyncMock()
-
-    target_site_manager = AsyncMock()
-    target_site_manager.list_all = AsyncMock(
-        return_value=target_sites
-    )
-
-    with patch.object(Path, "read_bytes", return_value=b"png_data"):
-        coordinator = _make_coordinator(
-            crawler=crawler,
-            compliance_analyzer=compliance_analyzer,
-            compliance_notifier=compliance_notifier,
-            screenshot_store=screenshot_store,
-            target_site_manager=target_site_manager,
-        )
-
-        await coordinator.run_cycle()
-
-    compliance_notifier.send_compliance_report.assert_called_once()
-
-
-@pytest.mark.asyncio
-@patch("brand_watchdog.coordinator.coordinator.get_session")
-async def test_email_sent_for_non_compliant_report(
+async def test_cycle_aborts_on_rule_set_error(
     mock_get_session_patch,
 ):
-    """Email é enviado quando relatório é non_compliant."""
+    """Ciclo é abortado quando diretório de regras está
+    vazio ou inacessível."""
     fake_session_fn, mock_session = _mock_get_session()
     mock_get_session_patch.side_effect = fake_session_fn
 
-    target_sites = [_make_target_site()]
-    capture = _make_capture_result()
-    report = _make_compliance_report(
-        overall_status="non_compliant", fail_count=2
+    rule_set_calculator = MagicMock(
+        spec=RuleSetVersionCalculator
+    )
+    rule_set_calculator.calculate.side_effect = (
+        RuleSetDirectoryError("Diretório vazio")
     )
 
-    crawler = AsyncMock()
-    crawler.capture = AsyncMock(return_value=capture)
-
-    compliance_analyzer = AsyncMock()
-    compliance_analyzer.analyze_compliance = AsyncMock(
-        return_value=report
+    coordinator = _make_coordinator(
+        rule_set_calculator=rule_set_calculator,
     )
 
-    compliance_notifier = AsyncMock()
-    compliance_notifier.send_compliance_report = AsyncMock(
-        return_value=True
-    )
+    result = await coordinator.run_cycle()
 
-    screenshot_store = AsyncMock()
-    screenshot_store.store = AsyncMock()
-
-    target_site_manager = AsyncMock()
-    target_site_manager.list_all = AsyncMock(
-        return_value=target_sites
-    )
-
-    with patch.object(Path, "read_bytes", return_value=b"png_data"):
-        coordinator = _make_coordinator(
-            crawler=crawler,
-            compliance_analyzer=compliance_analyzer,
-            compliance_notifier=compliance_notifier,
-            screenshot_store=screenshot_store,
-            target_site_manager=target_site_manager,
-        )
-
-        await coordinator.run_cycle()
-
-    compliance_notifier.send_compliance_report.assert_called_once()
-
-
-# --- Testes Sem Destinatários ---
+    assert result.sites_processed == 0
+    assert result.sites_failed == 0
 
 
 @pytest.mark.asyncio
 @patch("brand_watchdog.coordinator.coordinator.get_session")
-async def test_no_email_when_no_recipients(mock_get_session_patch):
-    """Não envia email se não há destinatários configurados."""
+async def test_rule_version_change_logged(
+    mock_get_session_patch,
+):
+    """Log registra mudança de versão de regras."""
     fake_session_fn, mock_session = _mock_get_session()
     mock_get_session_patch.side_effect = fake_session_fn
 
     target_sites = [_make_target_site()]
-    capture = _make_capture_result()
-    report = _make_compliance_report()
-
-    crawler = AsyncMock()
-    crawler.capture = AsyncMock(return_value=capture)
-
-    compliance_analyzer = AsyncMock()
-    compliance_analyzer.analyze_compliance = AsyncMock(
-        return_value=report
+    target_site_manager = AsyncMock()
+    target_site_manager.list_all = AsyncMock(
+        return_value=target_sites
     )
 
-    compliance_notifier = AsyncMock()
-    compliance_notifier.send_compliance_report = AsyncMock(
-        return_value=True
+    rule_set_calculator = MagicMock(
+        spec=RuleSetVersionCalculator
+    )
+    rule_set_calculator.calculate.return_value = (
+        "v1719850000_b4c3d2e1"
+    )
+    rule_set_calculator.has_changed.return_value = True
+
+    sqs_publisher = AsyncMock(spec=SQSPublisher)
+    sqs_publisher.publish_all = AsyncMock(
+        return_value=(1, 0)
     )
 
-    screenshot_store = AsyncMock()
-    screenshot_store.store = AsyncMock()
+    consolidator = AsyncMock(spec=CycleConsolidator)
+    consolidator.consolidate = AsyncMock(
+        return_value="completed"
+    )
+
+    coordinator = _make_coordinator(
+        rule_set_calculator=rule_set_calculator,
+        sqs_publisher=sqs_publisher,
+        consolidator=consolidator,
+        target_site_manager=target_site_manager,
+    )
+
+    # Simular versão anterior
+    coordinator._previous_rule_version = (
+        "v1719849600_a3b2c1d4"
+    )
+
+    with patch(
+        "brand_watchdog.coordinator.coordinator.logger"
+    ) as mock_logger:
+        await coordinator.run_cycle()
+
+    # Verificar que o log de mudança de versão foi chamado
+    info_calls = mock_logger.info.call_args_list
+    version_change_logged = any(
+        "vers" in str(call) and "v1719849600" in str(call)
+        and "v1719850000" in str(call)
+        for call in info_calls
+    )
+    assert version_change_logged, (
+        f"Log de mudança de versão não encontrado. "
+        f"Calls: {info_calls}"
+    )
+
+
+@pytest.mark.asyncio
+@patch("brand_watchdog.coordinator.coordinator.get_session")
+async def test_rule_version_stored_in_cycle(
+    mock_get_session_patch,
+):
+    """Versão de regras é armazenada no registro do ciclo."""
+    fake_session_fn, mock_session = _mock_get_session()
+    mock_get_session_patch.side_effect = fake_session_fn
+
+    target_sites = [_make_target_site()]
+    target_site_manager = AsyncMock()
+    target_site_manager.list_all = AsyncMock(
+        return_value=target_sites
+    )
+
+    rule_set_calculator = MagicMock(
+        spec=RuleSetVersionCalculator
+    )
+    rule_set_calculator.calculate.return_value = (
+        "v1719849600_a3b2c1d4"
+    )
+    rule_set_calculator.has_changed.return_value = False
+
+    sqs_publisher = AsyncMock(spec=SQSPublisher)
+    sqs_publisher.publish_all = AsyncMock(
+        return_value=(1, 0)
+    )
+
+    consolidator = AsyncMock(spec=CycleConsolidator)
+    consolidator.consolidate = AsyncMock(
+        return_value="completed"
+    )
+
+    coordinator = _make_coordinator(
+        rule_set_calculator=rule_set_calculator,
+        sqs_publisher=sqs_publisher,
+        consolidator=consolidator,
+        target_site_manager=target_site_manager,
+    )
+
+    await coordinator.run_cycle()
+
+    # Verificar que add foi chamado com rule_set_version
+    add_call = mock_session.add.call_args_list[0]
+    cycle_model = add_call[0][0]
+    assert cycle_model.rule_set_version == (
+        "v1719849600_a3b2c1d4"
+    )
+
+
+# --- Testes de Publicação SQS ---
+
+
+@pytest.mark.asyncio
+@patch("brand_watchdog.coordinator.coordinator.get_session")
+async def test_publish_failures_tracked(
+    mock_get_session_patch,
+):
+    """Falhas de publicação são registradas no ciclo."""
+    fake_session_fn, mock_session = _mock_get_session()
+    mock_get_session_patch.side_effect = fake_session_fn
+
+    target_sites = [
+        _make_target_site(url="https://a.com", site_id="s1"),
+        _make_target_site(url="https://b.com", site_id="s2"),
+        _make_target_site(url="https://c.com", site_id="s3"),
+    ]
 
     target_site_manager = AsyncMock()
     target_site_manager.list_all = AsyncMock(
         return_value=target_sites
     )
 
-    config = _make_config(recipients=[])
+    sqs_publisher = AsyncMock(spec=SQSPublisher)
+    # 2 publicados com sucesso, 1 falha
+    sqs_publisher.publish_all = AsyncMock(
+        return_value=(2, 1)
+    )
 
-    with patch.object(Path, "read_bytes", return_value=b"png_data"):
-        coordinator = _make_coordinator(
-            crawler=crawler,
-            compliance_analyzer=compliance_analyzer,
-            compliance_notifier=compliance_notifier,
-            screenshot_store=screenshot_store,
-            target_site_manager=target_site_manager,
-            config=config,
+    consolidator = AsyncMock(spec=CycleConsolidator)
+    consolidator.consolidate = AsyncMock(
+        return_value="completed"
+    )
+
+    coordinator = _make_coordinator(
+        target_site_manager=target_site_manager,
+        sqs_publisher=sqs_publisher,
+        consolidator=consolidator,
+    )
+
+    result = await coordinator.run_cycle()
+
+    assert result.sites_processed == 2
+    assert result.sites_failed == 1
+
+
+# --- Testes de Timeout de Publicação (5min) ---
+
+
+@pytest.mark.asyncio
+@patch("brand_watchdog.coordinator.coordinator.get_session")
+async def test_publish_timeout_registers_partial_results(
+    mock_get_session_patch,
+):
+    """Timeout de 5min na publicação registra resultados parciais.
+
+    Validates: Requirements 1.6
+    Quando a publicação excede o timeout, o coordinator
+    registra os sites não publicados como falhas e prossegue
+    com status 'dispatched'.
+    """
+    fake_session_fn, mock_session = _mock_get_session()
+    mock_get_session_patch.side_effect = fake_session_fn
+
+    target_sites = [
+        _make_target_site(
+            url=f"https://site{i}.com", site_id=f"s{i}"
         )
+        for i in range(20)
+    ]
 
-        await coordinator.run_cycle()
+    target_site_manager = AsyncMock()
+    target_site_manager.list_all = AsyncMock(
+        return_value=target_sites
+    )
 
-    compliance_notifier.send_compliance_report.assert_not_called()
+    # Simula publish_all retornando resultados parciais
+    # (10 publicadas com sucesso, 10 como falha por timeout)
+    sqs_publisher = AsyncMock(spec=SQSPublisher)
+    sqs_publisher.publish_all = AsyncMock(
+        return_value=(10, 10)
+    )
+
+    consolidator = AsyncMock(spec=CycleConsolidator)
+    consolidator.consolidate = AsyncMock(
+        return_value="completed"
+    )
+
+    coordinator = _make_coordinator(
+        target_site_manager=target_site_manager,
+        sqs_publisher=sqs_publisher,
+        consolidator=consolidator,
+    )
+
+    result = await coordinator.run_cycle()
+
+    # Coordinator registra 10 sucessos e 10 falhas
+    assert result.sites_processed == 10
+    assert result.sites_failed == 10
+
+
+# --- Testes de CycleConsolidator ---
+
+
+@pytest.mark.asyncio
+@patch("brand_watchdog.coordinator.coordinator.get_session")
+async def test_consolidator_started_as_background_task(
+    mock_get_session_patch,
+):
+    """Consolidador é iniciado como task assíncrona."""
+    fake_session_fn, mock_session = _mock_get_session()
+    mock_get_session_patch.side_effect = fake_session_fn
+
+    target_sites = [_make_target_site()]
+    target_site_manager = AsyncMock()
+    target_site_manager.list_all = AsyncMock(
+        return_value=target_sites
+    )
+
+    sqs_publisher = AsyncMock(spec=SQSPublisher)
+    sqs_publisher.publish_all = AsyncMock(
+        return_value=(1, 0)
+    )
+
+    consolidator = AsyncMock(spec=CycleConsolidator)
+    consolidator.consolidate = AsyncMock(
+        return_value="completed"
+    )
+
+    coordinator = _make_coordinator(
+        target_site_manager=target_site_manager,
+        sqs_publisher=sqs_publisher,
+        consolidator=consolidator,
+    )
+
+    await coordinator.run_cycle()
+
+    # Aguardar tasks pendentes
+    await asyncio.sleep(0.01)
+
+    consolidator.consolidate.assert_called_once()
+    call_kwargs = consolidator.consolidate.call_args.kwargs
+    assert call_kwargs["sites_dispatched"] == 1
 
 
 # --- Testes de Ciclo Sem Sites ---
@@ -518,7 +511,9 @@ async def test_no_email_when_no_recipients(mock_get_session_patch):
 
 @pytest.mark.asyncio
 @patch("brand_watchdog.coordinator.coordinator.get_session")
-async def test_cycle_with_no_target_sites(mock_get_session_patch):
+async def test_cycle_with_no_target_sites(
+    mock_get_session_patch,
+):
     """Ciclo sem target sites registrados termina sem erros."""
     fake_session_fn, mock_session = _mock_get_session()
     mock_get_session_patch.side_effect = fake_session_fn
@@ -552,235 +547,149 @@ async def test_concurrent_cycle_second_is_skipped(
     mock_get_session_patch.side_effect = fake_session_fn
 
     target_sites = [_make_target_site()]
-    capture = _make_capture_result()
-    report = _make_compliance_report()
 
     first_cycle_started = asyncio.Event()
     first_cycle_proceed = asyncio.Event()
 
-    async def slow_capture(url: str) -> CaptureResult:
-        """Captura lenta que sinaliza ciclo em execução."""
+    target_site_manager = AsyncMock()
+
+    async def slow_list_all():
         first_cycle_started.set()
         await first_cycle_proceed.wait()
-        return capture
+        return target_sites
 
-    crawler = AsyncMock()
-    crawler.capture = slow_capture
+    target_site_manager.list_all = slow_list_all
 
-    compliance_analyzer = AsyncMock()
-    compliance_analyzer.analyze_compliance = AsyncMock(
-        return_value=report
+    sqs_publisher = AsyncMock(spec=SQSPublisher)
+    sqs_publisher.publish_all = AsyncMock(
+        return_value=(1, 0)
     )
 
-    compliance_notifier = AsyncMock()
-    compliance_notifier.send_compliance_report = AsyncMock(
-        return_value=True
+    consolidator = AsyncMock(spec=CycleConsolidator)
+    consolidator.consolidate = AsyncMock(
+        return_value="completed"
     )
 
-    screenshot_store = AsyncMock()
-    screenshot_store.store = AsyncMock()
-
-    target_site_manager = AsyncMock()
-    target_site_manager.list_all = AsyncMock(
-        return_value=target_sites
+    coordinator = _make_coordinator(
+        target_site_manager=target_site_manager,
+        sqs_publisher=sqs_publisher,
+        consolidator=consolidator,
     )
 
-    with patch.object(Path, "read_bytes", return_value=b"png_data"):
-        coordinator = _make_coordinator(
-            crawler=crawler,
-            compliance_analyzer=compliance_analyzer,
-            compliance_notifier=compliance_notifier,
-            screenshot_store=screenshot_store,
-            target_site_manager=target_site_manager,
-        )
+    task1 = asyncio.create_task(coordinator.run_cycle())
+    await first_cycle_started.wait()
 
-        task1 = asyncio.create_task(coordinator.run_cycle())
-        await first_cycle_started.wait()
+    result2 = await coordinator.run_cycle()
 
-        result2 = await coordinator.run_cycle()
-
-        first_cycle_proceed.set()
-        result1 = await task1
+    first_cycle_proceed.set()
+    result1 = await task1
 
     assert result2.sites_processed == 0
     assert result2.site_results == []
     assert result1.sites_processed == 1
 
 
-# --- Teste de Stats no Banco ---
+# --- Testes de Messages Build ---
 
 
 @pytest.mark.asyncio
 @patch("brand_watchdog.coordinator.coordinator.get_session")
-async def test_cycle_record_created_and_updated(mock_get_session_patch):
-    """Verifica que _create_cycle_record e _update_cycle_record são
-    chamados corretamente."""
+async def test_messages_contain_correct_fields(
+    mock_get_session_patch,
+):
+    """Mensagens publicadas contêm todos os campos corretos."""
     fake_session_fn, mock_session = _mock_get_session()
     mock_get_session_patch.side_effect = fake_session_fn
 
     target_sites = [
-        _make_target_site(url="https://a.com", site_id="s1"),
-        _make_target_site(url="https://b.com", site_id="s2"),
+        _make_target_site(
+            url="https://sky.com",
+            site_id="uuid-1",
+            brand="sky_plus",
+        ),
     ]
-    capture_a = _make_capture_result(target_url="https://a.com")
-    capture_b = _make_capture_result(target_url="https://b.com")
-    report = _make_compliance_report()
-
-    crawler = AsyncMock()
-    crawler.capture = AsyncMock(
-        side_effect=[capture_a, capture_b]
-    )
-
-    compliance_analyzer = AsyncMock()
-    compliance_analyzer.analyze_compliance = AsyncMock(
-        return_value=report
-    )
-
-    compliance_notifier = AsyncMock()
-    compliance_notifier.send_compliance_report = AsyncMock(
-        return_value=True
-    )
-
-    screenshot_store = AsyncMock()
-    screenshot_store.store = AsyncMock()
 
     target_site_manager = AsyncMock()
     target_site_manager.list_all = AsyncMock(
         return_value=target_sites
     )
 
-    with patch.object(Path, "read_bytes", return_value=b"png_data"):
-        coordinator = _make_coordinator(
-            crawler=crawler,
-            compliance_analyzer=compliance_analyzer,
-            compliance_notifier=compliance_notifier,
-            screenshot_store=screenshot_store,
-            target_site_manager=target_site_manager,
-        )
+    rule_set_calculator = MagicMock(
+        spec=RuleSetVersionCalculator
+    )
+    rule_set_calculator.calculate.return_value = (
+        "v1719849600_a3b2c1d4"
+    )
+    rule_set_calculator.has_changed.return_value = False
 
-        result = await coordinator.run_cycle()
+    sqs_publisher = AsyncMock(spec=SQSPublisher)
+    sqs_publisher.publish_all = AsyncMock(
+        return_value=(1, 0)
+    )
 
-    assert result.sites_processed == 2
-    assert result.sites_failed == 0
-    # get_session chamado para create + update do ciclo
-    assert mock_get_session_patch.call_count >= 2
-    assert mock_session.add.called
-    assert mock_session.flush.called
+    consolidator = AsyncMock(spec=CycleConsolidator)
+    consolidator.consolidate = AsyncMock(
+        return_value="completed"
+    )
+
+    coordinator = _make_coordinator(
+        rule_set_calculator=rule_set_calculator,
+        sqs_publisher=sqs_publisher,
+        consolidator=consolidator,
+        target_site_manager=target_site_manager,
+    )
+
+    await coordinator.run_cycle()
+
+    call_args = sqs_publisher.publish_all.call_args
+    messages = call_args[0][0]
+    msg = messages[0]
+
+    assert msg.site_id == "uuid-1"
+    assert msg.brand == "sky_plus"
+    assert msg.url == "https://sky.com"
+    assert msg.rule_set_version == "v1719849600_a3b2c1d4"
+    # cycle_id é gerado internamente (UUID)
+    assert len(msg.cycle_id) > 0
 
 
-# --- Testes de Brand Per-Site ---
+# --- Testes de Status do Ciclo ---
 
 
 @pytest.mark.asyncio
 @patch("brand_watchdog.coordinator.coordinator.get_session")
-async def test_site_brand_passed_to_analyzer(mock_get_session_patch):
-    """Verifica que o brand do site é passado para analyze_compliance."""
+async def test_cycle_created_with_dispatched_status(
+    mock_get_session_patch,
+):
+    """Ciclo é criado com status 'dispatched'."""
     fake_session_fn, mock_session = _mock_get_session()
     mock_get_session_patch.side_effect = fake_session_fn
 
-    site_sky = _make_target_site(
-        url="https://sky.com", site_id="s1", brand="sky_plus"
-    )
-    site_dgo = _make_target_site(
-        url="https://dgo.com", site_id="s2", brand="dgo"
-    )
-    target_sites = [site_sky, site_dgo]
-
-    capture_sky = _make_capture_result(target_url="https://sky.com")
-    capture_dgo = _make_capture_result(target_url="https://dgo.com")
-    report = _make_compliance_report()
-
-    crawler = AsyncMock()
-    crawler.capture = AsyncMock(
-        side_effect=[capture_sky, capture_dgo]
-    )
-
-    compliance_analyzer = AsyncMock()
-    compliance_analyzer.analyze_compliance = AsyncMock(
-        return_value=report
-    )
-
-    compliance_notifier = AsyncMock()
-    compliance_notifier.send_compliance_report = AsyncMock(
-        return_value=True
-    )
-
-    screenshot_store = AsyncMock()
-    screenshot_store.store = AsyncMock()
-
+    target_sites = [_make_target_site()]
     target_site_manager = AsyncMock()
     target_site_manager.list_all = AsyncMock(
         return_value=target_sites
     )
 
-    with patch.object(Path, "read_bytes", return_value=b"png_data"):
-        coordinator = _make_coordinator(
-            crawler=crawler,
-            compliance_analyzer=compliance_analyzer,
-            compliance_notifier=compliance_notifier,
-            screenshot_store=screenshot_store,
-            target_site_manager=target_site_manager,
-        )
-
-        result = await coordinator.run_cycle()
-
-    assert result.sites_processed == 2
-    assert result.sites_failed == 0
-
-    # Verifica que analyze_compliance foi chamado com brand correto
-    calls = compliance_analyzer.analyze_compliance.call_args_list
-    assert len(calls) == 2
-    assert calls[0].kwargs.get("brand") == "sky_plus"
-    assert calls[1].kwargs.get("brand") == "dgo"
-
-
-@pytest.mark.asyncio
-@patch("brand_watchdog.coordinator.coordinator.get_session")
-async def test_default_brand_is_sky_plus(mock_get_session_patch):
-    """Sites sem brand explícito usam sky_plus como padrão."""
-    fake_session_fn, mock_session = _mock_get_session()
-    mock_get_session_patch.side_effect = fake_session_fn
-
-    # TargetSite sem brand explícito (usa default)
-    site = _make_target_site()
-    target_sites = [site]
-
-    capture = _make_capture_result()
-    report = _make_compliance_report()
-
-    crawler = AsyncMock()
-    crawler.capture = AsyncMock(return_value=capture)
-
-    compliance_analyzer = AsyncMock()
-    compliance_analyzer.analyze_compliance = AsyncMock(
-        return_value=report
+    sqs_publisher = AsyncMock(spec=SQSPublisher)
+    sqs_publisher.publish_all = AsyncMock(
+        return_value=(1, 0)
     )
 
-    compliance_notifier = AsyncMock()
-    compliance_notifier.send_compliance_report = AsyncMock(
-        return_value=True
+    consolidator = AsyncMock(spec=CycleConsolidator)
+    consolidator.consolidate = AsyncMock(
+        return_value="completed"
     )
 
-    screenshot_store = AsyncMock()
-    screenshot_store.store = AsyncMock()
-
-    target_site_manager = AsyncMock()
-    target_site_manager.list_all = AsyncMock(
-        return_value=target_sites
+    coordinator = _make_coordinator(
+        target_site_manager=target_site_manager,
+        sqs_publisher=sqs_publisher,
+        consolidator=consolidator,
     )
 
-    with patch.object(Path, "read_bytes", return_value=b"png_data"):
-        coordinator = _make_coordinator(
-            crawler=crawler,
-            compliance_analyzer=compliance_analyzer,
-            compliance_notifier=compliance_notifier,
-            screenshot_store=screenshot_store,
-            target_site_manager=target_site_manager,
-        )
+    await coordinator.run_cycle()
 
-        await coordinator.run_cycle()
-
-    call_kwargs = (
-        compliance_analyzer.analyze_compliance.call_args.kwargs
-    )
-    assert call_kwargs.get("brand") == "sky_plus"
+    # Primeiro add é a criação do ciclo
+    add_call = mock_session.add.call_args_list[0]
+    cycle_model = add_call[0][0]
+    assert cycle_model.status == "dispatched"

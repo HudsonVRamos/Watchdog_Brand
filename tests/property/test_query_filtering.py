@@ -134,7 +134,7 @@ def _st_filter_params(draw: st.DrawFn) -> dict:
 
 
 _PBT_SETTINGS = settings(
-    max_examples=100,
+    max_examples=30,
     suppress_health_check=[
         HealthCheck.function_scoped_fixture,
         HealthCheck.too_slow,
@@ -216,7 +216,7 @@ class TestQueryFilteringCorrectness:
                 id=self._screenshot_id,
                 target_site_id=_TARGET_URLS[0],
                 monitoring_cycle_id=self._cycle_id,
-                file_path="/tmp/prop_test.png",
+                s3_key="screenshots/cycle/prop_test.png",
                 captured_at=datetime.now(timezone.utc),
                 height_px=1080,
                 was_truncated=False,

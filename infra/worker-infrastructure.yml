@@ -1,0 +1,370 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Brand Watchdog Worker - Infraestrutura do Worker ECS com SQS, DLQ, Auto Scaling
+  e S3 lifecycle para processamento paralelo de sites.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: brand-watchdog
+    Description: Nome do projeto (prefixo para recursos)
+
+  Environment:
+    Type: String
+    Default: prod
+    AllowedValues: [prod, staging]
+    Description: Ambiente de deploy
+
+  WorkerImageUri:
+    Type: String
+    Description: "URI da imagem Docker do Worker no ECR"
+
+  VPCId:
+    Type: AWS::EC2::VPC::Id
+    Description: ID da VPC existente
+
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet::Id
+    Description: ID da subnet privada 1
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet::Id
+    Description: ID da subnet privada 2
+
+  ECSClusterArn:
+    Type: String
+    Description: ARN do ECS Cluster existente
+
+  ECSSecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: ID do Security Group do ECS
+
+  DatabaseUrl:
+    Type: String
+    NoEcho: true
+    Description: "URL de conexão PostgreSQL (postgresql+asyncpg://...)"
+
+  S3BucketName:
+    Type: String
+    Description: "Nome do bucket S3 para screenshots"
+
+  AlertSender:
+    Type: String
+    Description: "Email remetente para alertas (verificado no SES)"
+
+  AlertRecipients:
+    Type: String
+    Description: "Emails destinatários, separados por vírgula"
+
+  ScreenshotRetentionDays:
+    Type: Number
+    Default: 90
+    MinValue: 30
+    MaxValue: 365
+    Description: "Dias para expirar screenshots no S3"
+
+Resources:
+  # ============================================================
+  # SQS - Fila de Processamento + Dead Letter Queue
+  # ============================================================
+  WorkerDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${ProjectName}-dlq"
+      MessageRetentionPeriod: 1209600  # 14 dias (máximo)
+      VisibilityTimeout: 120
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  WorkerQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${ProjectName}-tasks"
+      VisibilityTimeout: 120  # Compatível com timeout de processamento do Worker
+      MessageRetentionPeriod: 1209600  # 14 dias
+      ReceiveMessageWaitTimeSeconds: 20  # Long polling para reduzir custos
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt WorkerDeadLetterQueue.Arn
+        maxReceiveCount: 3  # Após 3 falhas, move para DLQ
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ============================================================
+  # IAM - Roles para o Worker ECS
+  # ============================================================
+  WorkerTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-worker-execution-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: LogsAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !GetAtt WorkerLogGroup.Arn
+
+  WorkerTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-worker-task-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: WorkerPermissions
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # SQS - consumir mensagens da fila e DLQ
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:ChangeMessageVisibility
+                  - sqs:GetQueueAttributes
+                Resource:
+                  - !GetAtt WorkerQueue.Arn
+                  - !GetAtt WorkerDeadLetterQueue.Arn
+              # S3 - upload/download de screenshots
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub "arn:aws:s3:::${S3BucketName}"
+                  - !Sub "arn:aws:s3:::${S3BucketName}/*"
+              # Bedrock - invocar modelos de IA
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:InvokeModelWithResponseStream
+                Resource: "arn:aws:bedrock:us-east-1::foundation-model/anthropic.*"
+              # EventBridge - publicar eventos
+              - Effect: Allow
+                Action:
+                  - events:PutEvents
+                Resource: !Sub "arn:aws:events:${AWS::Region}:${AWS::AccountId}:event-bus/default"
+              # SES - envio de emails (notificações)
+              - Effect: Allow
+                Action:
+                  - ses:SendEmail
+                  - ses:SendRawEmail
+                Resource: "*"
+              # CloudWatch Logs
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+
+  # ============================================================
+  # CloudWatch Logs
+  # ============================================================
+  WorkerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/ecs/${ProjectName}-worker"
+      RetentionInDays: 30
+
+  # ============================================================
+  # ECS - Task Definition do Worker
+  # ============================================================
+  WorkerTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "${ProjectName}-worker"
+      Cpu: "1024"        # 1 vCPU
+      Memory: "2048"     # 2 GB - suficiente para Chromium (~1.4 GB)
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      ExecutionRoleArn: !GetAtt WorkerTaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt WorkerTaskRole.Arn
+      ContainerDefinitions:
+        - Name: !Sub "${ProjectName}-worker"
+          Image: !Ref WorkerImageUri
+          Essential: true
+          Environment:
+            - Name: QUEUE_URL
+              Value: !Ref WorkerQueue
+            - Name: DLQ_URL
+              Value: !Ref WorkerDeadLetterQueue
+            - Name: S3_BUCKET
+              Value: !Ref S3BucketName
+            - Name: DATABASE_URL
+              Value: !Ref DatabaseUrl
+            - Name: ALERT_SES_SENDER
+              Value: !Ref AlertSender
+            - Name: ALERT_RECIPIENTS
+              Value: !Ref AlertRecipients
+            - Name: AWS_DEFAULT_REGION
+              Value: us-east-1
+            - Name: WORKER_PROCESSING_TIMEOUT
+              Value: "120"
+            - Name: WORKER_VISIBILITY_RENEW_INTERVAL
+              Value: "60"
+            - Name: WORKER_VISIBILITY_TIMEOUT
+              Value: "120"
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref WorkerLogGroup
+              awslogs-region: !Ref "AWS::Region"
+              awslogs-stream-prefix: worker
+          HealthCheck:
+            Command:
+              - CMD-SHELL
+              - python -c "print('healthy')" || exit 1
+            Interval: 60
+            Timeout: 10
+            Retries: 3
+            StartPeriod: 60
+
+  # ============================================================
+  # ECS - Serviço do Worker
+  # ============================================================
+  WorkerService:
+    Type: AWS::ECS::Service
+    Properties:
+      ServiceName: !Sub "${ProjectName}-worker-service"
+      Cluster: !Ref ECSClusterArn
+      TaskDefinition: !Ref WorkerTaskDefinition
+      DesiredCount: 1
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          Subnets:
+            - !Ref PrivateSubnet1
+            - !Ref PrivateSubnet2
+          SecurityGroups:
+            - !Ref ECSSecurityGroupId
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 100
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Component
+          Value: worker
+
+  # ============================================================
+  # Auto Scaling - Target Tracking (5 mensagens por task)
+  # ============================================================
+  WorkerScalableTarget:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Properties:
+      MaxCapacity: 10
+      MinCapacity: 1
+      ResourceId: !Sub "service/${ECSClusterArn}/${WorkerService.Name}"
+      RoleARN: !Sub "arn:aws:iam::${AWS::AccountId}:role/aws-service-role/ecs.application-autoscaling.amazonaws.com/AWSServiceRoleForApplicationAutoScaling_ECSService"
+      ScalableDimension: ecs:service:DesiredCount
+      ServiceNamespace: ecs
+
+  WorkerScalingPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: !Sub "${ProjectName}-worker-target-tracking"
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref WorkerScalableTarget
+      TargetTrackingScalingPolicyConfiguration:
+        TargetValue: 5.0  # 5 mensagens visíveis por task
+        ScaleInCooldown: 120   # 2 minutos de cooldown para scale-in
+        ScaleOutCooldown: 60   # 1 minuto de cooldown para scale-out
+        CustomizedMetricSpecification:
+          MetricName: ApproximateNumberOfMessagesVisible
+          Namespace: AWS/SQS
+          Dimensions:
+            - Name: QueueName
+              Value: !GetAtt WorkerQueue.QueueName
+          Statistic: Average
+          Unit: Count
+
+  # ============================================================
+  # EventBridge - Regra para Notificações
+  # ============================================================
+  ComplianceCompletedRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "${ProjectName}-compliance-completed"
+      Description: "Aciona notificação quando análise de compliance é concluída"
+      EventBusName: default
+      State: ENABLED
+      EventPattern:
+        source:
+          - "brand-watchdog"
+        detail-type:
+          - "ComplianceCompleted"
+
+  # ============================================================
+  # CloudWatch Alarm - DLQ não vazia
+  # ============================================================
+  DLQAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-dlq-messages"
+      AlarmDescription: "Alerta quando há mensagens na DLQ (falhas de processamento)"
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt WorkerDeadLetterQueue.QueueName
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+Outputs:
+  WorkerQueueUrl:
+    Value: !Ref WorkerQueue
+    Description: URL da fila SQS do Worker
+
+  WorkerQueueArn:
+    Value: !GetAtt WorkerQueue.Arn
+    Description: ARN da fila SQS do Worker
+
+  DeadLetterQueueUrl:
+    Value: !Ref WorkerDeadLetterQueue
+    Description: URL da Dead Letter Queue
+
+  DeadLetterQueueArn:
+    Value: !GetAtt WorkerDeadLetterQueue.Arn
+    Description: ARN da Dead Letter Queue
+
+  WorkerTaskDefinitionArn:
+    Value: !Ref WorkerTaskDefinition
+    Description: ARN da Task Definition do Worker
+
+  WorkerServiceName:
+    Value: !GetAtt WorkerService.Name
+    Description: Nome do serviço ECS do Worker
+
+  WorkerLogGroupName:
+    Value: !Ref WorkerLogGroup
+    Description: CloudWatch Log Group do Worker

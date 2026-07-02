@@ -538,6 +538,9 @@ class ComplianceEmailNotifier:
                 f"  {rule.rule_id}: {rule.status} "
                 f"(confidence: {rule.confidence}%)"
             )
+            body_parts.append(
+                f"    {rule.description}"
+            )
         body_parts.append("")
 
         # Rodapé

@@ -1,0 +1,44 @@
+# Brand Watchdog Worker ECS - Dockerfile de produção
+# Python 3.12 + Playwright + Chromium headless
+# Imagem otimizada para processamento paralelo via SQS
+#
+# Requisitos de memória: ~1.4GB+ (Chromium headless + imagens de referência)
+# Entry point: python -m brand_watchdog.worker
+
+FROM python:3.12-slim
+
+# Variáveis de ambiente
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PLAYWRIGHT_BROWSERS_PATH=/opt/playwright
+
+# Diretório de trabalho
+WORKDIR /app
+
+# Instala dependências Python primeiro (cache de layer)
+COPY pyproject.toml ./
+RUN pip install .
+
+# Instala Playwright com Chromium e suas dependências de sistema
+RUN playwright install --with-deps chromium
+
+# Copia código da aplicação
+COPY brand_watchdog/ ./brand_watchdog/
+COPY config.yaml ./config.yaml
+COPY watchdog_rules/ ./watchdog_rules/
+
+# Cria diretórios de dados (temporários, screenshots vão para S3)
+RUN mkdir -p /app/data
+
+# Usuário não-root para segurança
+RUN useradd -m -r appuser && chown -R appuser:appuser /app /opt/playwright
+USER appuser
+
+# Health check via processo ativo
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD pgrep -f "brand_watchdog.worker" || exit 1
+
+# Entry point: Worker ECS (loop de consumo SQS)
+CMD ["python", "-m", "brand_watchdog.worker"]

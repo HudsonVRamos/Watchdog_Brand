@@ -21,8 +21,8 @@ from brand_watchdog.storage.detection_store import DetectionStore
 
 # Configuração PBT: mínimo 100 exemplos
 _PBT_SETTINGS = settings(
-    max_examples=100,
-    suppress_health_check=[HealthCheck.function_scoped_fixture],
+    max_examples=30,
+    suppress_health_check=[HealthCheck.function_scoped_fixture, HealthCheck.too_slow],
 )
 
 

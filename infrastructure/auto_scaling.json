@@ -1,0 +1,38 @@
+{
+  "$comment": "Configuração de Auto Scaling para o Worker ECS. Este arquivo serve como referência - a configuração real está no CloudFormation (infra/worker-infrastructure.yml).",
+  "scalableTarget": {
+    "serviceNamespace": "ecs",
+    "resourceId": "service/brand-watchdog-cluster/brand-watchdog-worker-service",
+    "scalableDimension": "ecs:service:DesiredCount",
+    "minCapacity": 1,
+    "maxCapacity": 10
+  },
+  "scalingPolicy": {
+    "policyName": "brand-watchdog-worker-target-tracking",
+    "policyType": "TargetTrackingScaling",
+    "targetTrackingScalingPolicyConfiguration": {
+      "targetValue": 5.0,
+      "scaleInCooldown": 120,
+      "scaleOutCooldown": 60,
+      "customizedMetricSpecification": {
+        "metricName": "ApproximateNumberOfMessagesVisible",
+        "namespace": "AWS/SQS",
+        "dimensions": [
+          {
+            "name": "QueueName",
+            "value": "brand-watchdog-tasks"
+          }
+        ],
+        "statistic": "Average",
+        "unit": "Count"
+      }
+    }
+  },
+  "description": {
+    "strategy": "Target Tracking com métrica customizada SQS",
+    "logic": "Mantém ~5 mensagens visíveis por task em execução",
+    "scaleOut": "Adiciona tasks quando há mais de 5 msg/task (cooldown 60s)",
+    "scaleIn": "Remove tasks quando há menos de 5 msg/task (cooldown 120s)",
+    "range": "Escala de 1 a 10 tasks ECS Fargate"
+  }
+}

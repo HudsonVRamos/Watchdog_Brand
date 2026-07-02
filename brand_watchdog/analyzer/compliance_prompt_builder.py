@@ -30,12 +30,21 @@ class PromptPayload:
 
     Attributes:
         images: Lista de tuplas (image_bytes, label) na ordem:
-            [screenshot, ...reference_images]
+            [screenshot, ...reference_images] (build_prompt) ou
+            [...reference_images, screenshot] (build_prompt_cached).
         prompt_text: Texto completo do prompt com regras de compliance.
+        cache_control_index: Índice do último bloco estático na
+            lista de imagens (para marcação cache_control ephemeral).
+            None quando Prompt Caching não está habilitado.
+        media_types: Lista de media_types correspondente a cada
+            imagem em images. None quando não especificado
+            (backward compatibility com build_prompt).
     """
 
     images: list[tuple[bytes, str]]  # (image_bytes, label)
     prompt_text: str
+    cache_control_index: int | None = None
+    media_types: list[str] | None = None
 
 
 # Mapeamento de imagens de referência por brand
@@ -127,6 +136,76 @@ class CompliancePromptBuilder:
         prompt_text = self._build_rules_text()
 
         return PromptPayload(images=images, prompt_text=prompt_text)
+
+    def build_prompt_cached(
+        self,
+        screenshot_bytes: bytes,
+        reference_images: list[tuple[bytes, str]] | None = None,
+    ) -> PromptPayload:
+        """Constrói payload otimizado para Prompt Caching do Bedrock.
+
+        Organiza o payload com conteúdo estático (regras + imagens de
+        referência) ANTES do conteúdo variável (screenshot), permitindo
+        que o Bedrock reutilize o prefixo entre chamadas consecutivas.
+
+        As imagens de referência são recebidas já em bytes (JPEG, do
+        ReferenceImageCache) e o screenshot é recebido diretamente
+        como bytes (PNG).
+
+        Args:
+            screenshot_bytes: Bytes do screenshot (formato PNG).
+            reference_images: Lista de tuplas (image_bytes, label)
+                com imagens de referência já processadas pelo
+                ReferenceImageCache (formato JPEG). Se None ou
+                vazia, o payload contém apenas o screenshot.
+
+        Returns:
+            PromptPayload com imagens ordenadas para Prompt Caching:
+            - Imagens de referência (estáticas, JPEG) primeiro
+            - Screenshot (variável, PNG) por último
+            - cache_control_index apontando para o último bloco
+              estático (última referência)
+            - media_types indicando o formato de cada imagem
+
+        Raises:
+            AnalysisIncompleteError: Se screenshot_bytes estiver vazio.
+        """
+        if not screenshot_bytes:
+            raise AnalysisIncompleteError(
+                "Screenshot vazio ou ilegível (bytes vazios)"
+            )
+
+        # Montar lista de imagens: ESTÁTICAS primeiro, VARIÁVEL depois
+        images: list[tuple[bytes, str]] = []
+        media_types: list[str] = []
+
+        # Referências primeiro (estáticas, JPEG)
+        if reference_images:
+            for ref_bytes, ref_label in reference_images:
+                images.append((ref_bytes, ref_label))
+                media_types.append("image/jpeg")
+
+        # Screenshot por último (variável, PNG)
+        images.append(
+            (screenshot_bytes, "screenshot_under_analysis")
+        )
+        media_types.append("image/png")
+
+        # Determinar índice do último bloco estático
+        # (última imagem de referência, antes do screenshot)
+        cache_control_index: int | None = None
+        if reference_images:
+            cache_control_index = len(reference_images) - 1
+
+        # Construir texto de regras
+        prompt_text = self._build_rules_text()
+
+        return PromptPayload(
+            images=images,
+            prompt_text=prompt_text,
+            cache_control_index=cache_control_index,
+            media_types=media_types,
+        )
 
     def _load_screenshot(self, screenshot_path: Path) -> bytes:
         """Carrega os bytes do screenshot para análise.
