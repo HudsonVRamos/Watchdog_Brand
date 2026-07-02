@@ -23,6 +23,7 @@ RUN playwright install --with-deps chromium
 # Copia código da aplicação
 COPY brand_watchdog/ ./brand_watchdog/
 COPY config.yaml ./config.yaml
+COPY watchdog_rules/ ./watchdog_rules/
 
 # Cria diretórios de dados
 RUN mkdir -p /app/data/screenshots /app/data/logos

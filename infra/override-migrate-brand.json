@@ -1,0 +1,8 @@
+{
+  "containerOverrides": [
+    {
+      "name": "brand-watchdog",
+      "command": ["python", "-c", "import asyncio\nfrom brand_watchdog.config import load_config\nfrom brand_watchdog.models.database import setup_database, get_engine\nfrom sqlalchemy import text\nfrom pathlib import Path\n\nasync def migrate():\n    config = load_config(Path('config.yaml') if Path('config.yaml').exists() else None)\n    setup_database(config.storage)\n    engine = get_engine()\n    async with engine.begin() as conn:\n        await conn.execute(text(\"ALTER TABLE target_sites ADD COLUMN IF NOT EXISTS brand VARCHAR(20) NOT NULL DEFAULT 'sky_plus'\"))\n    print('Migration completed: brand column added')\n\nasyncio.run(migrate())"]
+    }
+  ]
+}

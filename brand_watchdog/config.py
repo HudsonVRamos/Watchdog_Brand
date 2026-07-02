@@ -71,6 +71,10 @@ class StorageConfig:
     database_url: str = "sqlite+aiosqlite:///./data/brand_watchdog.db"
 
 
+# Valid brand types for compliance monitoring
+BRAND_TYPES = ("sky_plus", "dgo")
+
+
 @dataclass
 class AppConfig:
     """Configuração raiz da aplicação, agrega todas as sub-configurações."""
@@ -81,6 +85,7 @@ class AppConfig:
     schedule: ScheduleConfig = field(default_factory=ScheduleConfig)
     storage: StorageConfig = field(default_factory=StorageConfig)
     max_target_sites: int = 200
+    brand: str = "sky_plus"  # "sky_plus" or "dgo"
 
 
 # Mapeamento de nomes de seção para suas dataclasses

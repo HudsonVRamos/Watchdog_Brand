@@ -27,8 +27,9 @@ from brand_watchdog.config import (
 )
 from brand_watchdog.coordinator.coordinator import MonitoringCoordinator
 from brand_watchdog.models.dataclasses import (
-    BrandAsset,
     CaptureResult,
+    ComplianceReport,
+    ComplianceRuleResult,
     TargetSite,
 )
 
@@ -77,33 +78,37 @@ def _make_coordinator(
     target_sites: list[TargetSite],
 ) -> MonitoringCoordinator:
     """Cria MonitoringCoordinator com mocks para sucesso total."""
-    analyzer = AsyncMock()
-    analyzer.analyze = AsyncMock(return_value=[])
+    compliance_analyzer = AsyncMock()
+    compliance_analyzer.analyze_compliance = AsyncMock(
+        return_value=ComplianceReport(
+            target_url="https://example.com",
+            analyzed_at=datetime(
+                2024, 6, 15, 10, 1, 0, tzinfo=timezone.utc
+            ),
+            overall_status="compliant",
+            rule_results=[
+                ComplianceRuleResult(
+                    rule_id="facilitator_role",
+                    status="PASS",
+                    confidence=92,
+                    description="OK",
+                ),
+            ],
+            screenshot_ref_id="ref-123",
+            cycle_id="cycle-1",
+        )
+    )
 
-    alert_service = AsyncMock()
-    alert_service.send_alert = AsyncMock(return_value=True)
+    compliance_notifier = AsyncMock()
+    compliance_notifier.send_compliance_report = AsyncMock(
+        return_value=True
+    )
 
     detection_store = AsyncMock()
     detection_store.save = AsyncMock(return_value="det-1")
 
     screenshot_store = AsyncMock()
     screenshot_store.store = AsyncMock()
-
-    brand_registry = AsyncMock()
-    brand_registry.get_all_assets = AsyncMock(
-        return_value=[
-            BrandAsset(
-                id="asset-1",
-                asset_type="logo",
-                file_path=Path("/logos/brand.png"),
-                text_value=None,
-                content_hash="abc123",
-                original_filename="brand.png",
-                file_size_bytes=1024,
-                created_at=datetime(2024, 1, 1, tzinfo=timezone.utc),
-            )
-        ]
-    )
 
     target_site_manager = AsyncMock()
     target_site_manager.list_all = AsyncMock(
@@ -112,11 +117,10 @@ def _make_coordinator(
 
     return MonitoringCoordinator(
         crawler=crawler,
-        analyzer=analyzer,
-        alert_service=alert_service,
+        compliance_analyzer=compliance_analyzer,
+        compliance_notifier=compliance_notifier,
         detection_store=detection_store,
         screenshot_store=screenshot_store,
-        brand_registry=brand_registry,
         target_site_manager=target_site_manager,
         config=_make_config(),
     )

@@ -52,13 +52,17 @@ class TargetSiteManager:
         """
         return self._url_validator.normalize(url)
 
-    async def register(self, url: str) -> TargetSite:
+    async def register(
+        self, url: str, brand: str = "sky_plus"
+    ) -> TargetSite:
         """Registra novo site-alvo após validação.
 
         Fluxo: validate → normalize → check duplicate → check limit → persist.
 
         Args:
             url: URL do site-alvo a registrar.
+            brand: Tipo de brand para monitoramento.
+                "sky_plus" (padrão) ou "dgo".
 
         Returns:
             TargetSite dataclass com dados do site registrado.
@@ -67,6 +71,15 @@ class TargetSiteManager:
             ValueError: Se a URL for inválida, duplicada ou o limite
                         máximo de sites foi atingido.
         """
+        # Validar brand
+        from brand_watchdog.config import BRAND_TYPES
+
+        if brand not in BRAND_TYPES:
+            raise ValueError(
+                f"Brand inválido: '{brand}'. "
+                f"Valores aceitos: {BRAND_TYPES}"
+            )
+
         # 1. Validar URL
         validation = self.validate_url(url)
         if not validation.valid:
@@ -108,6 +121,7 @@ class TargetSiteManager:
             model = TargetSiteModel(
                 url=url,
                 normalized_url=normalized,
+                brand=brand,
             )
             session.add(model)
             await session.flush()
@@ -119,6 +133,7 @@ class TargetSiteManager:
                 normalized_url=model.normalized_url,
                 created_at=model.created_at,
                 active=model.active,
+                brand=model.brand,
             )
 
     async def remove(self, site_id: str) -> bool:
@@ -165,6 +180,7 @@ class TargetSiteManager:
                     normalized_url=m.normalized_url,
                     created_at=m.created_at,
                     active=m.active,
+                    brand=m.brand,
                 )
                 for m in models
             ]

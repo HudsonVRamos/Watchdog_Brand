@@ -5,6 +5,7 @@ de monitoramento manualmente.
 
 Uso:
     python -m brand_watchdog.cli add-site https://www.skymais.com.br/home
+    python -m brand_watchdog.cli add-site https://dgo.com/promo --brand dgo
     python -m brand_watchdog.cli add-text "SKY"
     python -m brand_watchdog.cli list-sites
     python -m brand_watchdog.cli list-assets
@@ -41,24 +42,33 @@ async def _setup():
     return config
 
 
-async def add_site(url: str) -> None:
+async def add_site(url: str, brand: str = "sky_plus") -> None:
     """Adiciona um target site para monitoramento."""
     config = await _setup()
 
+    from brand_watchdog.config import BRAND_TYPES
     from brand_watchdog.registry.target_site_manager import (
         TargetSiteManager,
     )
+
+    if brand not in BRAND_TYPES:
+        print(
+            f"❌ Brand inválido: '{brand}'. "
+            f"Valores aceitos: {BRAND_TYPES}"
+        )
+        sys.exit(1)
 
     manager = TargetSiteManager(
         max_target_sites=config.max_target_sites,
     )
 
     try:
-        site = await manager.register(url)
+        site = await manager.register(url, brand=brand)
         print(f"✅ Site registrado com sucesso!")
         print(f"   ID: {site.id}")
         print(f"   URL: {site.url}")
         print(f"   Normalizada: {site.normalized_url}")
+        print(f"   Brand: {site.brand}")
     except Exception as e:
         print(f"❌ Erro ao registrar site: {e}")
         sys.exit(1)
@@ -105,7 +115,8 @@ async def list_sites() -> None:
     print(f"{'='*60}")
     for site in sites:
         status = "🟢 Ativo" if site.active else "🔴 Inativo"
-        print(f"  {status} {site.url}")
+        brand_label = "SKY+" if site.brand == "sky_plus" else "DGO"
+        print(f"  {status} [{brand_label}] {site.url}")
         print(f"       ID: {site.id}")
         print(f"       Criado: {site.created_at}")
         print()
@@ -194,17 +205,20 @@ async def run_cycle() -> None:
     """Dispara um ciclo de monitoramento manualmente."""
     config = await _setup()
 
-    from brand_watchdog.alerts.alert_service import AlertService
+    from brand_watchdog.alerts.compliance_email_notifier import (
+        ComplianceEmailNotifier,
+    )
     from brand_watchdog.alerts.email_providers import (
         create_email_provider,
     )
-    from brand_watchdog.analyzer.analyzer import Analyzer
     from brand_watchdog.analyzer.bedrock_client import BedrockClient
+    from brand_watchdog.analyzer.compliance_analyzer import (
+        ComplianceAnalyzer,
+    )
     from brand_watchdog.coordinator.coordinator import (
         MonitoringCoordinator,
     )
     from brand_watchdog.crawler.crawler import Crawler
-    from brand_watchdog.registry.brand_registry import BrandRegistry
     from brand_watchdog.registry.target_site_manager import (
         TargetSiteManager,
     )
@@ -213,29 +227,29 @@ async def run_cycle() -> None:
 
     crawler = Crawler(config=config.crawler, storage_config=config.storage)
     bedrock_client = BedrockClient(config=config.analyzer)
-    analyzer = Analyzer(config=config.analyzer, bedrock_client=bedrock_client)
     detection_store = DetectionStore(config=config.storage)
-    screenshot_store = ScreenshotStore(config=config.storage)
-    brand_registry = BrandRegistry(
-        logo_storage_path=config.storage.screenshot_base_path.parent / "logos"
+    compliance_analyzer = ComplianceAnalyzer(
+        config=config.analyzer,
+        bedrock_client=bedrock_client,
+        detection_store=detection_store,
+        storage_config=config.storage,
     )
+    screenshot_store = ScreenshotStore(config=config.storage)
     target_site_manager = TargetSiteManager(
         max_target_sites=config.max_target_sites
     )
     email_provider = create_email_provider(config.alert)
-    alert_service = AlertService(
+    compliance_notifier = ComplianceEmailNotifier(
         config=config.alert,
-        detection_store=detection_store,
         email_provider=email_provider,
     )
 
     coordinator = MonitoringCoordinator(
         crawler=crawler,
-        analyzer=analyzer,
-        alert_service=alert_service,
+        compliance_analyzer=compliance_analyzer,
+        compliance_notifier=compliance_notifier,
         detection_store=detection_store,
         screenshot_store=screenshot_store,
-        brand_registry=brand_registry,
         target_site_manager=target_site_manager,
         config=config,
     )
@@ -270,7 +284,7 @@ def main():
     """Entry point da CLI."""
     if len(sys.argv) < 2:
         print("Uso:")
-        print("  python -m brand_watchdog.cli add-site <url>")
+        print("  python -m brand_watchdog.cli add-site <url> [--brand sky_plus|dgo]")
         print("  python -m brand_watchdog.cli remove-site <id>")
         print("  python -m brand_watchdog.cli list-sites")
         print("  python -m brand_watchdog.cli add-text <texto>")
@@ -283,9 +297,20 @@ def main():
 
     if command == "add-site":
         if len(sys.argv) < 3:
-            print("❌ Forneça a URL: add-site <url>")
+            print("❌ Forneça a URL: add-site <url> [--brand sky_plus|dgo]")
             sys.exit(1)
-        asyncio.run(add_site(sys.argv[2]))
+        url = sys.argv[2]
+        brand = "sky_plus"
+        # Parse --brand flag
+        remaining_args = sys.argv[3:]
+        if "--brand" in remaining_args:
+            idx = remaining_args.index("--brand")
+            if idx + 1 < len(remaining_args):
+                brand = remaining_args[idx + 1]
+            else:
+                print("❌ Forneça o valor do brand: --brand sky_plus|dgo")
+                sys.exit(1)
+        asyncio.run(add_site(url, brand=brand))
 
     elif command == "remove-site":
         if len(sys.argv) < 3:

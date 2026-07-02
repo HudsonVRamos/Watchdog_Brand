@@ -155,6 +155,185 @@ class BedrockClient:
                 f"Resposta do modelo não é JSON válido: {cleaned[:200]}"
             ) from exc
 
+    # Constantes para validação de payload multi-imagem
+    MAX_TOTAL_PAYLOAD_BYTES: int = 20 * 1024 * 1024  # 20 MB
+    MAX_SINGLE_IMAGE_BYTES: int = 5 * 1024 * 1024    # 5 MB
+    MAX_IMAGES: int = 5
+
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=2, min=2, max=8),
+        retry=retry_if_exception_type(
+            (BotoCoreError, ClientError, TimeoutError)
+        ),
+        reraise=True,
+    )
+    async def invoke_model_multi(
+        self, images: list[tuple[bytes, str]], prompt: str
+    ) -> dict[str, Any]:
+        """Invoca Claude via Bedrock com múltiplas imagens e prompt.
+
+        Constrói o payload multimodal com labels de texto antes de cada
+        imagem, seguidos do prompt no final. Suporta até 5 imagens.
+        Retry automático com backoff exponencial: 2s, 4s, 8s.
+
+        Args:
+            images: Lista de tuplas (image_bytes, label) onde label identifica
+                o papel da imagem. A primeira imagem é sempre o screenshot.
+                Labels esperados: "screenshot_under_analysis",
+                "approved_art_reference", "correct_logo_reference",
+                "wrong_logo_example".
+            prompt: Prompt textual com instruções de análise.
+
+        Returns:
+            Dicionário JSON parseado da resposta do modelo.
+
+        Raises:
+            BotoCoreError: Erro de infraestrutura AWS.
+            ClientError: Erro do serviço Bedrock.
+            TimeoutError: Timeout de 60 segundos excedido.
+            ValueError: Resposta do modelo não contém JSON válido.
+        """
+        validated_images = self._validate_payload_size(images)
+        request_body = self._build_multi_image_payload(validated_images, prompt)
+
+        total_size = sum(len(img) for img, _ in validated_images)
+        logger.debug(
+            "Invocando Bedrock multi-image modelo=%s, imagens=%d, total=%d bytes",
+            self._config.bedrock_model_id,
+            len(validated_images),
+            total_size,
+        )
+
+        response = await asyncio.to_thread(
+            self._client.invoke_model,
+            modelId=self._config.bedrock_model_id,
+            body=json.dumps(request_body),
+            contentType="application/json",
+            accept="application/json",
+        )
+
+        response_body = json.loads(response["body"].read())
+        return self._extract_json_from_response(response_body)
+
+    def _build_multi_image_payload(
+        self, images: list[tuple[bytes, str]], prompt: str
+    ) -> dict[str, Any]:
+        """Constrói payload multimodal com labels de texto antes de cada imagem.
+
+        Formato do content array:
+        [
+            {"type": "text", "text": label_1},
+            {"type": "image", "source": {"type": "base64", ...}},
+            {"type": "text", "text": label_2},
+            {"type": "image", "source": {"type": "base64", ...}},
+            ...
+            {"type": "text", "text": prompt}
+        ]
+
+        Args:
+            images: Lista de tuplas (image_bytes, label) já validadas.
+            prompt: Prompt textual para análise.
+
+        Returns:
+            Dicionário com o payload completo para o Bedrock Messages API.
+        """
+        content: list[dict[str, Any]] = []
+
+        for image_bytes, label in images:
+            image_base64 = base64.b64encode(image_bytes).decode("utf-8")
+            # Text block com o label antes da imagem
+            content.append({"type": "text", "text": label})
+            # Image block
+            content.append(
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/png",
+                        "data": image_base64,
+                    },
+                }
+            )
+
+        # Prompt no final do content array
+        content.append({"type": "text", "text": prompt})
+
+        return {
+            "anthropic_version": "bedrock-2023-05-31",
+            "max_tokens": 4096,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": content,
+                }
+            ],
+        }
+
+    def _validate_payload_size(
+        self, images: list[tuple[bytes, str]]
+    ) -> list[tuple[bytes, str]]:
+        """Filtra imagens por tamanho, mantendo sempre o screenshot (índice 0).
+
+        Regras:
+        - A primeira imagem (screenshot) NUNCA é filtrada.
+        - Imagens de referência (índice > 0) com mais de 5 MB são descartadas
+          com log warning.
+        - Se o total de todas as imagens (incluindo screenshot) exceder 20 MB,
+          retorna apenas o screenshot com log error.
+
+        Args:
+            images: Lista de tuplas (image_bytes, label). Índice 0 é o
+                screenshot.
+
+        Returns:
+            Lista filtrada de tuplas (image_bytes, label), sempre contendo
+            pelo menos o screenshot (índice 0).
+        """
+        if not images:
+            return images
+
+        # Sempre incluir o screenshot (índice 0)
+        screenshot = images[0]
+        filtered: list[tuple[bytes, str]] = [screenshot]
+
+        # Filtrar imagens de referência individuais > 5 MB
+        for i, (img_bytes, label) in enumerate(images[1:], start=1):
+            img_size = len(img_bytes)
+            if img_size > self.MAX_SINGLE_IMAGE_BYTES:
+                logger.warning(
+                    "Imagem de referência '%s' (índice %d) excede 5 MB "
+                    "(%d bytes). Descartando.",
+                    label,
+                    i,
+                    img_size,
+                )
+            else:
+                filtered.append((img_bytes, label))
+
+        # Verificar total do payload
+        total_size = sum(len(img) for img, _ in filtered)
+        if total_size > self.MAX_TOTAL_PAYLOAD_BYTES:
+            logger.error(
+                "Payload total excede 20 MB (%d bytes). "
+                "Enviando apenas o screenshot.",
+                total_size,
+            )
+            return [screenshot]
+
+        # Limitar ao máximo de 5 imagens
+        if len(filtered) > self.MAX_IMAGES:
+            logger.warning(
+                "Número de imagens (%d) excede o máximo de %d. "
+                "Truncando para %d imagens.",
+                len(filtered),
+                self.MAX_IMAGES,
+                self.MAX_IMAGES,
+            )
+            filtered = filtered[: self.MAX_IMAGES]
+
+        return filtered
+
     @staticmethod
     def _strip_markdown_code_block(text: str) -> str:
         """Remove wrapper de code block markdown do texto.

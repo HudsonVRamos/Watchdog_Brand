@@ -205,3 +205,56 @@ class TestListAll:
         sites = await manager.list_all()
         assert len(sites) == 1
         assert sites[0].url == "https://site2.com"
+
+
+class TestBrandSupport:
+    """Testes para suporte a brand por site."""
+
+    async def test_registro_com_brand_sky_plus(
+        self, manager: TargetSiteManager
+    ):
+        """Deve registrar site com brand sky_plus (padrão)."""
+        site = await manager.register("https://example.com")
+        assert site.brand == "sky_plus"
+
+    async def test_registro_com_brand_dgo(
+        self, manager: TargetSiteManager
+    ):
+        """Deve registrar site com brand dgo."""
+        site = await manager.register(
+            "https://dgo.com", brand="dgo"
+        )
+        assert site.brand == "dgo"
+
+    async def test_registro_com_brand_invalido(
+        self, manager: TargetSiteManager
+    ):
+        """Deve rejeitar brand inválido."""
+        with pytest.raises(ValueError, match="Brand inválido"):
+            await manager.register(
+                "https://example.com", brand="invalid"
+            )
+
+    async def test_list_all_inclui_brand(
+        self, manager: TargetSiteManager
+    ):
+        """list_all deve incluir brand no TargetSite retornado."""
+        await manager.register(
+            "https://sky.com", brand="sky_plus"
+        )
+        await manager.register(
+            "https://dgo.com", brand="dgo"
+        )
+
+        sites = await manager.list_all()
+        assert len(sites) == 2
+        brands = {s.url: s.brand for s in sites}
+        assert brands["https://sky.com"] == "sky_plus"
+        assert brands["https://dgo.com"] == "dgo"
+
+    async def test_registro_default_brand_backward_compat(
+        self, manager: TargetSiteManager
+    ):
+        """Sites registrados sem brand devem ter sky_plus."""
+        site = await manager.register("https://old-site.com")
+        assert site.brand == "sky_plus"

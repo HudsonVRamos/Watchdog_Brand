@@ -58,6 +58,7 @@ class TargetSiteModel(Base):
     normalized_url: str = Column(String(2048), nullable=False, unique=True)
     created_at: datetime = Column(DateTime(timezone=True), default=_utcnow)
     active: bool = Column(Boolean, default=True)
+    brand: str = Column(String(20), nullable=False, default="sky_plus")
 
     # Relationships
     screenshots = relationship(

@@ -56,3 +56,15 @@ Thumbs.db
 # Distribution
 *.tar.gz
 *.whl
+
+# Zip files (source bundles)
+source.zip
+
+# Excel temp/lock files
+~$*
+
+# Scripts cache
+scripts/.cache_*
+
+# Kiro internal
+.kiro/

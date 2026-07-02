@@ -96,14 +96,17 @@ async def main() -> None:
     logger.info("Banco de dados inicializado")
 
     # 3. Instanciar componentes com injeção de dependências
-    from brand_watchdog.alerts.alert_service import AlertService
-    from brand_watchdog.analyzer.analyzer import Analyzer
+    from brand_watchdog.alerts.compliance_email_notifier import (
+        ComplianceEmailNotifier,
+    )
     from brand_watchdog.analyzer.bedrock_client import BedrockClient
+    from brand_watchdog.analyzer.compliance_analyzer import (
+        ComplianceAnalyzer,
+    )
     from brand_watchdog.coordinator.coordinator import (
         MonitoringCoordinator,
     )
     from brand_watchdog.crawler.crawler import Crawler
-    from brand_watchdog.registry.brand_registry import BrandRegistry
     from brand_watchdog.registry.target_site_manager import (
         TargetSiteManager,
     )
@@ -117,44 +120,39 @@ async def main() -> None:
         storage_config=config.storage,
     )
 
-    # Analyzer + BedrockClient
+    # ComplianceAnalyzer + BedrockClient
     bedrock_client = BedrockClient(config=config.analyzer)
-    analyzer = Analyzer(
+    detection_store = DetectionStore(config=config.storage)
+    compliance_analyzer = ComplianceAnalyzer(
         config=config.analyzer,
         bedrock_client=bedrock_client,
+        detection_store=detection_store,
+        storage_config=config.storage,
+        brand=config.brand,
     )
 
     # Stores
-    detection_store = DetectionStore(config=config.storage)
     screenshot_store = ScreenshotStore(config=config.storage)
-
-    # Brand Registry
-    brand_registry = BrandRegistry(
-        logo_storage_path=config.storage.screenshot_base_path.parent
-        / "logos",
-    )
 
     # Target Site Manager
     target_site_manager = TargetSiteManager(
         max_target_sites=config.max_target_sites,
     )
 
-    # Alert Service + Email Provider
+    # Compliance Email Notifier
     email_provider = _create_email_provider(config)
-    alert_service = AlertService(
+    compliance_notifier = ComplianceEmailNotifier(
         config=config.alert,
-        detection_store=detection_store,
         email_provider=email_provider,
     )
 
     # Monitoring Coordinator
     coordinator = MonitoringCoordinator(
         crawler=crawler,
-        analyzer=analyzer,
-        alert_service=alert_service,
+        compliance_analyzer=compliance_analyzer,
+        compliance_notifier=compliance_notifier,
         detection_store=detection_store,
         screenshot_store=screenshot_store,
-        brand_registry=brand_registry,
         target_site_manager=target_site_manager,
         config=config,
     )

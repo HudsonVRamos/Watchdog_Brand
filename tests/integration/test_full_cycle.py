@@ -1,12 +1,13 @@
-"""Teste de integração end-to-end do ciclo de monitoramento.
+"""Teste de integração end-to-end do ciclo de monitoramento compliance.
 
-Valida o fluxo completo: captura → análise → alerta → persistência → stats.
-Usa banco SQLite em memória (real) e mocka apenas serviços externos:
+Valida o fluxo completo: captura → analyze_compliance → notify →
+persistência → stats. Usa banco SQLite em memória (real) e mocka
+apenas serviços externos:
 - Playwright (Crawler) → retorna screenshot mock
-- AWS Bedrock (Analyzer) → retorna detecção mock em JSON
-- SES/SMTP (AlertService) → captura emails enviados
+- AWS Bedrock (ComplianceAnalyzer) → retorna ComplianceReport mock
+- SES/SMTP (ComplianceEmailNotifier) → captura emails enviados
 
-Requirements: 5.1, 5.3, 5.6
+Requirements: 1.1, 8.1, 9.1
 """
 
 from __future__ import annotations
@@ -19,8 +20,10 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from sqlalchemy import select
 
-from brand_watchdog.alerts.alert_service import AlertService, EmailProvider
-from brand_watchdog.analyzer.analyzer import Analyzer
+from brand_watchdog.alerts.compliance_email_notifier import (
+    ComplianceEmailNotifier,
+)
+from brand_watchdog.analyzer.compliance_analyzer import ComplianceAnalyzer
 from brand_watchdog.config import (
     AlertConfig,
     AnalyzerConfig,
@@ -37,18 +40,15 @@ from brand_watchdog.models.database import (
     setup_database,
 )
 from brand_watchdog.models.dataclasses import (
-    BoundingBox,
     CaptureResult,
-    DetectionResult,
+    ComplianceReport,
+    ComplianceRuleResult,
 )
 from brand_watchdog.models.entities import (
-    BrandAssetModel,
-    DetectionResultModel,
     MonitoringCycleModel,
     ScreenshotModel,
     TargetSiteModel,
 )
-from brand_watchdog.registry.brand_registry import BrandRegistry
 from brand_watchdog.registry.target_site_manager import TargetSiteManager
 from brand_watchdog.storage.detection_store import DetectionStore
 from brand_watchdog.storage.screenshot_store import ScreenshotStore
@@ -74,12 +74,10 @@ async def setup_db(tmp_path: Path):
 
 @pytest.fixture
 async def seed_data(setup_db: StorageConfig):
-    """Cria Target Sites e Brand Assets reais no banco de dados."""
+    """Cria Target Sites reais no banco de dados."""
     sites = []
-    assets = []
 
     async with get_session() as session:
-        # Cria 2 Target Sites
         site_1 = TargetSiteModel(
             id=str(uuid.uuid4()),
             url="https://example-site-1.com/page",
@@ -96,38 +94,15 @@ async def seed_data(setup_db: StorageConfig):
         session.add(site_2)
         sites = [site_1, site_2]
 
-        # Cria Brand Assets (1 logo + 1 texto)
-        asset_logo = BrandAssetModel(
-            id=str(uuid.uuid4()),
-            asset_type="logo",
-            file_path="/fake/logo.png",
-            text_value=None,
-            content_hash="abc123hash",
-            original_filename="brand_logo.png",
-            file_size_bytes=2048,
-        )
-        asset_text = BrandAssetModel(
-            id=str(uuid.uuid4()),
-            asset_type="text",
-            file_path=None,
-            text_value="MinhaMarca",
-            content_hash="def456hash",
-            original_filename=None,
-            file_size_bytes=None,
-        )
-        session.add(asset_logo)
-        session.add(asset_text)
-        assets = [asset_logo, asset_text]
-
-    return {"sites": sites, "assets": assets, "config": setup_db}
+    return {"sites": sites, "config": setup_db}
 
 
 @pytest.fixture
-def app_config(setup_db: StorageConfig, tmp_path: Path) -> AppConfig:
-    """Cria AppConfig com threshold para alertas."""
+def app_config(setup_db: StorageConfig) -> AppConfig:
+    """Cria AppConfig para testes de integração."""
     return AppConfig(
         crawler=CrawlerConfig(),
-        analyzer=AnalyzerConfig(confidence_threshold=70),
+        analyzer=AnalyzerConfig(),
         alert=AlertConfig(
             provider="ses",
             ses_sender="alerts@brand-watchdog.com",
@@ -140,22 +115,14 @@ def app_config(setup_db: StorageConfig, tmp_path: Path) -> AppConfig:
 
 
 @pytest.fixture
-def mock_email_provider() -> AsyncMock:
-    """Mock do provedor de email que captura envios."""
-    provider = AsyncMock(spec=EmailProvider)
-    provider.send = AsyncMock(return_value=None)
-    return provider
-
-
-@pytest.fixture
 def mock_crawler(tmp_path: Path) -> AsyncMock:
     """Mock do Crawler que retorna screenshots simulados."""
     crawler = AsyncMock(spec=Crawler)
-
-    # Cria um arquivo PNG fake no filesystem para cada captura
     fake_png_bytes = b"\x89PNG\r\n\x1a\n" + b"\x00" * 100
 
-    async def capture_side_effect(target_url: str) -> CaptureResult:
+    async def capture_side_effect(
+        target_url: str,
+    ) -> CaptureResult:
         screenshot_ref_id = str(uuid.uuid4())
         screenshot_path = tmp_path / f"{screenshot_ref_id}.png"
         screenshot_path.write_bytes(fake_png_bytes)
@@ -174,37 +141,75 @@ def mock_crawler(tmp_path: Path) -> AsyncMock:
 
 
 @pytest.fixture
-def mock_analyzer() -> AsyncMock:
-    """Mock do Analyzer que retorna detecções simuladas."""
-    analyzer = AsyncMock(spec=Analyzer)
+def mock_compliance_analyzer() -> AsyncMock:
+    """Mock do ComplianceAnalyzer que retorna relatório compliant."""
+    analyzer = AsyncMock(spec=ComplianceAnalyzer)
 
     async def analyze_side_effect(
         screenshot_path: Path,
-        brand_assets: list,
-        target_url: str = "",
-        screenshot_ref_id: str = "",
-    ) -> list[DetectionResult]:
-        """Retorna 1 detecção por site com confidence alta."""
-        now = datetime.now(timezone.utc)
-        return [
-            DetectionResult(
-                target_url=target_url,
-                match_type="logo",
-                confidence=85,
-                bounding_box=BoundingBox(
-                    x_percent=10.0,
-                    y_percent=20.0,
-                    width_percent=15.0,
-                    height_percent=8.0,
+        target_url: str,
+        screenshot_ref_id: str,
+        cycle_id: str,
+        brand: str | None = None,
+    ) -> ComplianceReport:
+        return ComplianceReport(
+            target_url=target_url,
+            analyzed_at=datetime.now(timezone.utc),
+            overall_status="compliant",
+            rule_results=[
+                ComplianceRuleResult(
+                    rule_id="facilitator_role",
+                    status="PASS",
+                    confidence=92,
+                    description="SKY+ referenciado corretamente",
                 ),
-                description="Logo da marca encontrado no header",
-                detected_at=now,
-                screenshot_ref_id=screenshot_ref_id,
-            ),
-        ]
+                ComplianceRuleResult(
+                    rule_id="logo_application",
+                    status="PASS",
+                    confidence=88,
+                    description="Logos em ordem correta",
+                ),
+                ComplianceRuleResult(
+                    rule_id="logo_effects",
+                    status="PASS",
+                    confidence=90,
+                    description="Sem efeitos indevidos",
+                ),
+                ComplianceRuleResult(
+                    rule_id="content_separation",
+                    status="PASS",
+                    confidence=85,
+                    description="Conteúdo separado OK",
+                ),
+                ComplianceRuleResult(
+                    rule_id="naming_pricing",
+                    status="PASS",
+                    confidence=95,
+                    description="Nomenclatura correta",
+                ),
+                ComplianceRuleResult(
+                    rule_id="kv_integrity",
+                    status="PASS",
+                    confidence=91,
+                    description="KV íntegro",
+                ),
+            ],
+            screenshot_ref_id=screenshot_ref_id,
+            cycle_id=cycle_id,
+        )
 
-    analyzer.analyze = AsyncMock(side_effect=analyze_side_effect)
+    analyzer.analyze_compliance = AsyncMock(
+        side_effect=analyze_side_effect
+    )
     return analyzer
+
+
+@pytest.fixture
+def mock_compliance_notifier() -> AsyncMock:
+    """Mock do ComplianceEmailNotifier que captura envios."""
+    notifier = AsyncMock(spec=ComplianceEmailNotifier)
+    notifier.send_compliance_report = AsyncMock(return_value=True)
+    return notifier
 
 
 # --- Testes de Integração ---
@@ -212,63 +217,47 @@ def mock_analyzer() -> AsyncMock:
 
 @pytest.mark.integration
 class TestFullMonitoringCycle:
-    """Testes de integração para o ciclo completo de monitoramento."""
+    """Testes de integração para o ciclo completo de compliance."""
 
     async def test_full_cycle_end_to_end(
         self,
         seed_data: dict,
         app_config: AppConfig,
         mock_crawler: AsyncMock,
-        mock_analyzer: AsyncMock,
-        mock_email_provider: AsyncMock,
+        mock_compliance_analyzer: AsyncMock,
+        mock_compliance_notifier: AsyncMock,
     ) -> None:
-        """Ciclo completo: captura → análise → alerta → persistência.
+        """Ciclo completo: captura → analyze_compliance → notify.
 
         Verifica:
         - Todos os sites foram capturados
-        - Análise foi executada com brand assets corretos
-        - DetectionResults foram persistidos no banco
-        - Alertas foram enviados para detecções acima do threshold
+        - Análise de compliance executada para cada site
+        - Relatório enviado para cada site
         - CycleResult stats estão corretos
-        - MonitoringCycleModel foi criado e atualizado no banco
+        - MonitoringCycleModel criado e atualizado no banco
         """
         sites = seed_data["sites"]
         config = seed_data["config"]
 
-        # Instancia componentes reais com stores reais (banco real)
         detection_store = DetectionStore(config)
         screenshot_store = ScreenshotStore(config)
-        brand_registry = BrandRegistry(
-            logo_storage_path=config.screenshot_base_path / "logos"
-        )
         target_site_manager = TargetSiteManager(
             max_target_sites=app_config.max_target_sites
         )
 
-        # AlertService com email provider mockado
-        alert_service = AlertService(
-            config=app_config.alert,
-            detection_store=detection_store,
-            email_provider=mock_email_provider,
-        )
-
-        # Monta o coordinator com mocks externos + stores reais
         coordinator = MonitoringCoordinator(
             crawler=mock_crawler,
-            analyzer=mock_analyzer,
-            alert_service=alert_service,
+            compliance_analyzer=mock_compliance_analyzer,
+            compliance_notifier=mock_compliance_notifier,
             detection_store=detection_store,
             screenshot_store=screenshot_store,
-            brand_registry=brand_registry,
             target_site_manager=target_site_manager,
             config=app_config,
         )
 
-        # Executa ciclo completo
         cycle_result = await coordinator.run_cycle()
 
-        # --- Verificação 1: Captura ---
-        # Crawler deve ter sido chamado para cada site
+        # Verificação 1: Captura
         assert mock_crawler.capture.call_count == 2
         captured_urls = sorted(
             call.args[0]
@@ -277,50 +266,26 @@ class TestFullMonitoringCycle:
         expected_urls = sorted(s.url for s in sites)
         assert captured_urls == expected_urls
 
-        # --- Verificação 2: Análise ---
-        # Analyzer deve ter sido chamado para cada site
-        assert mock_analyzer.analyze.call_count == 2
-        for call in mock_analyzer.analyze.call_args_list:
-            kwargs = call.kwargs
-            # Verifica que brand_assets foram passados
-            assert len(kwargs["brand_assets"]) == 2
+        # Verificação 2: Análise de compliance
+        assert (
+            mock_compliance_analyzer.analyze_compliance.call_count
+            == 2
+        )
 
-        # --- Verificação 3: Persistência de DetectionResults ---
-        async with get_session() as session:
-            stmt = select(DetectionResultModel)
-            result = await session.execute(stmt)
-            detection_models = result.scalars().all()
+        # Verificação 3: Notificação enviada para cada site
+        assert (
+            mock_compliance_notifier.send_compliance_report
+            .call_count == 2
+        )
 
-        # 1 detecção por site = 2 detecções persistidas
-        assert len(detection_models) == 2
-        for dm in detection_models:
-            assert dm.match_type == "logo"
-            assert dm.confidence == 85
-            assert dm.description == "Logo da marca encontrado no header"
-
-        # --- Verificação 4: Alertas ---
-        # Confiança 85 >= threshold 70 → alertas devem ser enviados
-        # 2 detecções × 2 destinatários = 4 emails
-        assert mock_email_provider.send.call_count == 4
-
-        # Verifica que os destinatários corretos foram usados
-        recipients_called = [
-            call.kwargs["recipient"]
-            for call in mock_email_provider.send.call_args_list
-        ]
-        assert recipients_called.count("owner@empresa.com") == 2
-        assert recipients_called.count("legal@empresa.com") == 2
-
-        # --- Verificação 5: CycleResult stats ---
+        # Verificação 4: CycleResult stats
         assert cycle_result.sites_processed == 2
         assert cycle_result.sites_failed == 0
-        assert cycle_result.detections_found == 2
         assert len(cycle_result.site_results) == 2
         for sr in cycle_result.site_results:
             assert sr.success is True
-            assert len(sr.detections) == 1
 
-        # --- Verificação 6: MonitoringCycleModel no banco ---
+        # Verificação 5: MonitoringCycleModel no banco
         async with get_session() as session:
             stmt = select(MonitoringCycleModel).where(
                 MonitoringCycleModel.id == cycle_result.cycle_id
@@ -332,7 +297,6 @@ class TestFullMonitoringCycle:
         assert cycle_model.status == "completed"
         assert cycle_model.sites_processed == 2
         assert cycle_model.sites_failed == 0
-        assert cycle_model.detections_found == 2
         assert cycle_model.started_at is not None
         assert cycle_model.ended_at is not None
         assert cycle_model.ended_at >= cycle_model.started_at
@@ -341,26 +305,22 @@ class TestFullMonitoringCycle:
         self,
         seed_data: dict,
         app_config: AppConfig,
-        mock_analyzer: AsyncMock,
-        mock_email_provider: AsyncMock,
+        mock_compliance_analyzer: AsyncMock,
+        mock_compliance_notifier: AsyncMock,
         tmp_path: Path,
     ) -> None:
-        """Ciclo com um site falhando: verifica isolamento de falha.
-
-        Req 5.5: Se um site falhar, o ciclo continua com os demais.
-        """
-        sites = seed_data["sites"]
+        """Ciclo com um site falhando: verifica isolamento de falha."""
         config = seed_data["config"]
 
-        # Crawler que falha no primeiro site e sucede no segundo
         crawler = AsyncMock(spec=Crawler)
         fake_png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 50
         call_counter = {"count": 0}
 
-        async def capture_partial_fail(target_url: str) -> CaptureResult:
+        async def capture_partial_fail(
+            target_url: str,
+        ) -> CaptureResult:
             call_counter["count"] += 1
             if call_counter["count"] == 1:
-                # Primeiro site falha
                 return CaptureResult(
                     target_url=target_url,
                     screenshot_path=Path(""),
@@ -372,7 +332,6 @@ class TestFullMonitoringCycle:
                     error_message="Timeout de 60s",
                 )
             else:
-                # Segundo site OK
                 ref_id = str(uuid.uuid4())
                 path = tmp_path / f"{ref_id}.png"
                 path.write_bytes(fake_png)
@@ -386,44 +345,40 @@ class TestFullMonitoringCycle:
                     success=True,
                 )
 
-        crawler.capture = AsyncMock(side_effect=capture_partial_fail)
+        crawler.capture = AsyncMock(
+            side_effect=capture_partial_fail
+        )
 
-        # Componentes reais
         detection_store = DetectionStore(config)
         screenshot_store = ScreenshotStore(config)
-        brand_registry = BrandRegistry(
-            logo_storage_path=config.screenshot_base_path / "logos"
-        )
         target_site_manager = TargetSiteManager(
             max_target_sites=app_config.max_target_sites
-        )
-        alert_service = AlertService(
-            config=app_config.alert,
-            detection_store=detection_store,
-            email_provider=mock_email_provider,
         )
 
         coordinator = MonitoringCoordinator(
             crawler=crawler,
-            analyzer=mock_analyzer,
-            alert_service=alert_service,
+            compliance_analyzer=mock_compliance_analyzer,
+            compliance_notifier=mock_compliance_notifier,
             detection_store=detection_store,
             screenshot_store=screenshot_store,
-            brand_registry=brand_registry,
             target_site_manager=target_site_manager,
             config=app_config,
         )
 
         cycle_result = await coordinator.run_cycle()
 
-        # 1 processado com sucesso, 1 falhou
         assert cycle_result.sites_processed == 1
         assert cycle_result.sites_failed == 1
-        # Apenas 1 detecção (do site que não falhou)
-        assert cycle_result.detections_found == 1
-
-        # Analyzer chamado apenas para o site que obteve sucesso
-        assert mock_analyzer.analyze.call_count == 1
+        # Análise chamada apenas para o site com sucesso
+        assert (
+            mock_compliance_analyzer.analyze_compliance.call_count
+            == 1
+        )
+        # Notificação apenas para o site com sucesso
+        assert (
+            mock_compliance_notifier.send_compliance_report
+            .call_count == 1
+        )
 
         # MonitoringCycleModel reflete a falha parcial
         async with get_session() as session:
@@ -437,127 +392,106 @@ class TestFullMonitoringCycle:
         assert cycle_model.sites_processed == 1
         assert cycle_model.sites_failed == 1
 
-    async def test_cycle_no_alerts_below_threshold(
+    async def test_email_always_sent_regardless_of_status(
         self,
         seed_data: dict,
         app_config: AppConfig,
         mock_crawler: AsyncMock,
-        mock_email_provider: AsyncMock,
+        mock_compliance_notifier: AsyncMock,
     ) -> None:
-        """Detecções abaixo do threshold não geram alertas."""
+        """Email é enviado independentemente do status (compliant
+        ou non_compliant)."""
         config = seed_data["config"]
 
-        # Analyzer retorna detecção com confidence baixa (50 < 70)
-        analyzer_low = AsyncMock(spec=Analyzer)
+        # Analyzer que retorna non_compliant
+        analyzer_fail = AsyncMock(spec=ComplianceAnalyzer)
 
-        async def analyze_low_confidence(
+        async def analyze_non_compliant(
             screenshot_path: Path,
-            brand_assets: list,
-            target_url: str = "",
-            screenshot_ref_id: str = "",
-        ) -> list[DetectionResult]:
-            now = datetime.now(timezone.utc)
-            return [
-                DetectionResult(
-                    target_url=target_url,
-                    match_type="text",
-                    confidence=50,
-                    bounding_box=BoundingBox(
-                        x_percent=5.0,
-                        y_percent=80.0,
-                        width_percent=20.0,
-                        height_percent=3.0,
+            target_url: str,
+            screenshot_ref_id: str,
+            cycle_id: str,
+            brand: str | None = None,
+        ) -> ComplianceReport:
+            return ComplianceReport(
+                target_url=target_url,
+                analyzed_at=datetime.now(timezone.utc),
+                overall_status="non_compliant",
+                rule_results=[
+                    ComplianceRuleResult(
+                        rule_id="facilitator_role",
+                        status="FAIL",
+                        confidence=87,
+                        description="Amazon sem referência SKY+",
                     ),
-                    description="Texto similar encontrado no footer",
-                    detected_at=now,
-                    screenshot_ref_id=screenshot_ref_id,
-                ),
-            ]
+                ],
+                screenshot_ref_id=screenshot_ref_id,
+                cycle_id=cycle_id,
+            )
 
-        analyzer_low.analyze = AsyncMock(
-            side_effect=analyze_low_confidence
+        analyzer_fail.analyze_compliance = AsyncMock(
+            side_effect=analyze_non_compliant
         )
 
-        # Componentes reais
         detection_store = DetectionStore(config)
         screenshot_store = ScreenshotStore(config)
-        brand_registry = BrandRegistry(
-            logo_storage_path=config.screenshot_base_path / "logos"
-        )
         target_site_manager = TargetSiteManager(
             max_target_sites=app_config.max_target_sites
-        )
-        alert_service = AlertService(
-            config=app_config.alert,
-            detection_store=detection_store,
-            email_provider=mock_email_provider,
         )
 
         coordinator = MonitoringCoordinator(
             crawler=mock_crawler,
-            analyzer=analyzer_low,
-            alert_service=alert_service,
+            compliance_analyzer=analyzer_fail,
+            compliance_notifier=mock_compliance_notifier,
             detection_store=detection_store,
             screenshot_store=screenshot_store,
-            brand_registry=brand_registry,
             target_site_manager=target_site_manager,
             config=app_config,
         )
 
         cycle_result = await coordinator.run_cycle()
 
-        # Detecções foram encontradas e persistidas
-        assert cycle_result.detections_found == 2
+        # Email enviado para todos os 2 sites (mesmo non_compliant)
+        assert (
+            mock_compliance_notifier.send_compliance_report
+            .call_count == 2
+        )
         assert cycle_result.sites_processed == 2
-
-        # Mas nenhum alerta enviado (confidence 50 < threshold 70)
-        assert mock_email_provider.send.call_count == 0
 
     async def test_cycle_screenshots_persisted_in_db(
         self,
         seed_data: dict,
         app_config: AppConfig,
         mock_crawler: AsyncMock,
-        mock_analyzer: AsyncMock,
-        mock_email_provider: AsyncMock,
+        mock_compliance_analyzer: AsyncMock,
+        mock_compliance_notifier: AsyncMock,
     ) -> None:
-        """Verifica que screenshots são persistidos no banco com metadados."""
+        """Verifica que screenshots são persistidos no banco."""
         config = seed_data["config"]
 
         detection_store = DetectionStore(config)
         screenshot_store = ScreenshotStore(config)
-        brand_registry = BrandRegistry(
-            logo_storage_path=config.screenshot_base_path / "logos"
-        )
         target_site_manager = TargetSiteManager(
             max_target_sites=app_config.max_target_sites
-        )
-        alert_service = AlertService(
-            config=app_config.alert,
-            detection_store=detection_store,
-            email_provider=mock_email_provider,
         )
 
         coordinator = MonitoringCoordinator(
             crawler=mock_crawler,
-            analyzer=mock_analyzer,
-            alert_service=alert_service,
+            compliance_analyzer=mock_compliance_analyzer,
+            compliance_notifier=mock_compliance_notifier,
             detection_store=detection_store,
             screenshot_store=screenshot_store,
-            brand_registry=brand_registry,
             target_site_manager=target_site_manager,
             config=app_config,
         )
 
         cycle_result = await coordinator.run_cycle()
 
-        # Verifica screenshots persistidos
         async with get_session() as session:
             stmt = select(ScreenshotModel)
             result = await session.execute(stmt)
             screenshots = result.scalars().all()
 
-        # 2 sites = 2 screenshots
         assert len(screenshots) == 2
         for ss in screenshots:
             assert ss.monitoring_cycle_id == cycle_result.cycle_id

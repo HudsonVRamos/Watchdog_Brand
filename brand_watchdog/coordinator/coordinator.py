@@ -1,10 +1,11 @@
-"""Coordenador de ciclos de monitoramento.
+"""Coordenador de ciclos de monitoramento de compliance.
 
-Orquestra o fluxo completo: capture → analyze → alert para cada
-Target Site ativo, com lock de ciclo para evitar execuções sobrepostas,
-persistência de resultados e logging de estatísticas.
+Orquestra o fluxo completo: capture → analyze_compliance → notify
+para cada Target Site ativo, com lock de ciclo para evitar
+execuções sobrepostas, persistência de resultados e logging
+de estatísticas.
 
-Requirements: 5.1, 5.3, 5.4, 5.5, 5.6
+Requirements: 1.1, 8.1, 9.1
 """
 
 from __future__ import annotations
@@ -14,18 +15,20 @@ import logging
 import uuid
 from datetime import datetime, timezone
 
-from brand_watchdog.alerts.alert_service import AlertService
-from brand_watchdog.analyzer.analyzer import Analyzer
+from brand_watchdog.alerts.compliance_email_notifier import (
+    ComplianceEmailNotifier,
+)
+from brand_watchdog.analyzer.compliance_analyzer import ComplianceAnalyzer
 from brand_watchdog.config import AppConfig
 from brand_watchdog.crawler.crawler import Crawler
 from brand_watchdog.models.database import get_session
 from brand_watchdog.models.dataclasses import (
+    ComplianceReport,
     CycleResult,
     SiteResult,
     TargetSite,
 )
 from brand_watchdog.models.entities import MonitoringCycleModel
-from brand_watchdog.registry.brand_registry import BrandRegistry
 from brand_watchdog.registry.target_site_manager import TargetSiteManager
 from brand_watchdog.storage.detection_store import DetectionStore
 from brand_watchdog.storage.screenshot_store import ScreenshotStore
@@ -34,22 +37,25 @@ logger = logging.getLogger(__name__)
 
 
 class MonitoringCoordinator:
-    """Coordena ciclos completos de monitoramento de marca.
+    """Coordena ciclos completos de monitoramento de compliance.
 
     Responsabilidades:
-        - Executar ciclos de monitoramento (capture → analyze → alert)
+        - Executar ciclos de monitoramento
+          (capture → analyze_compliance → notify)
         - Garantir que apenas um ciclo executa por vez (lock)
-        - Processar todos os Target Sites ativos com isolamento de falha
+        - Processar todos os Target Sites ativos com isolamento
+          de falha
         - Persistir ciclo e estatísticas no banco de dados
         - Logar início, fim e resultados do ciclo
 
     Args:
         crawler: Instância do Crawler para captura de screenshots.
-        analyzer: Instância do Analyzer para detecção de marca.
-        alert_service: Instância do AlertService para notificações.
+        compliance_analyzer: Instância do ComplianceAnalyzer para
+            validação de compliance.
+        compliance_notifier: Instância do ComplianceEmailNotifier
+            para envio de relatórios.
         detection_store: Store para persistência de detecções.
         screenshot_store: Store para persistência de screenshots.
-        brand_registry: Registro de ativos de marca.
         target_site_manager: Gerenciador de sites-alvo.
         config: Configuração da aplicação.
     """
@@ -57,20 +63,18 @@ class MonitoringCoordinator:
     def __init__(
         self,
         crawler: Crawler,
-        analyzer: Analyzer,
-        alert_service: AlertService,
+        compliance_analyzer: ComplianceAnalyzer,
+        compliance_notifier: ComplianceEmailNotifier,
         detection_store: DetectionStore,
         screenshot_store: ScreenshotStore,
-        brand_registry: BrandRegistry,
         target_site_manager: TargetSiteManager,
         config: AppConfig,
     ) -> None:
         self._crawler = crawler
-        self._analyzer = analyzer
-        self._alert_service = alert_service
+        self._compliance_analyzer = compliance_analyzer
+        self._compliance_notifier = compliance_notifier
         self._detection_store = detection_store
         self._screenshot_store = screenshot_store
-        self._brand_registry = brand_registry
         self._target_site_manager = target_site_manager
         self._config = config
         self._cycle_running = False
@@ -82,8 +86,9 @@ class MonitoringCoordinator:
         Fluxo:
             1. Verifica lock de ciclo (se já em execução, pula)
             2. Cria MonitoringCycleModel no banco com status="running"
-            3. Obtém todos os Target Sites ativos e Brand Assets
-            4. Processa cada site (capture → analyze → alert)
+            3. Obtém todos os Target Sites ativos
+            4. Processa cada site
+               (capture → analyze_compliance → notify)
             5. Atualiza ciclo com stats e status="completed"
             6. Loga resumo completo do ciclo
 
@@ -92,13 +97,11 @@ class MonitoringCoordinator:
             Se o ciclo foi pulado (lock), retorna CycleResult
             com sites_processed=0 e status refletindo o skip.
         """
-        # Verifica se um ciclo já está em execução (Req 5.4)
         if self._is_cycle_running():
             logger.warning(
                 "Ciclo de monitoramento pulado: ciclo anterior "
                 "ainda em execução"
             )
-            # Registra ciclo pulado no banco
             skipped_cycle_id = str(uuid.uuid4())
             now = datetime.now(timezone.utc)
             await self._create_cycle_record(
@@ -124,7 +127,6 @@ class MonitoringCoordinator:
                 site_results=[],
             )
 
-        # Adquire lock de ciclo
         async with self._lock:
             self._cycle_running = True
 
@@ -151,16 +153,13 @@ class MonitoringCoordinator:
             started_at.isoformat(),
         )
 
-        # Cria registro do ciclo no banco (Req 5.6)
         await self._create_cycle_record(
             cycle_id=cycle_id,
             started_at=started_at,
             status="running",
         )
 
-        # Obtém Target Sites ativos e Brand Assets (Req 5.3)
         target_sites = await self._target_site_manager.list_all()
-        brand_assets = await self._brand_registry.get_all_assets()
 
         if not target_sites:
             logger.warning(
@@ -168,34 +167,36 @@ class MonitoringCoordinator:
                 "Ciclo encerrado sem processamento."
             )
 
-        if not brand_assets:
-            logger.warning(
-                "Nenhum Brand Asset registrado. "
-                "Análise não será executada."
-            )
-
-        # Processa cada site (Req 5.3, 5.5)
         site_results: list[SiteResult] = []
+        cycle_reports: list[ComplianceReport] = []
         sites_processed = 0
         sites_failed = 0
         total_detections = 0
 
         for target_site in target_sites:
-            site_result = await self._process_site(
+            site_result, report = await self._process_site(
                 target_site=target_site,
-                brand_assets=brand_assets,
                 cycle_id=cycle_id,
             )
             site_results.append(site_result)
 
             if site_result.success:
                 sites_processed += 1
+                if report is not None:
+                    cycle_reports.append(report)
             else:
                 sites_failed += 1
 
             total_detections += len(site_result.detections)
 
-        # Atualiza ciclo com stats finais (Req 5.6)
+        # Enviar email consolidado do ciclo (1 único email)
+        recipients = self._config.alert.recipients
+        if recipients and cycle_reports:
+            await self._compliance_notifier.send_cycle_report(
+                reports=cycle_reports,
+                recipients=recipients,
+            )
+
         ended_at = datetime.now(timezone.utc)
         await self._update_cycle_record(
             cycle_id=cycle_id,
@@ -206,7 +207,6 @@ class MonitoringCoordinator:
             status="completed",
         )
 
-        # Log de ciclo completo (Req 5.6)
         logger.info(
             "Ciclo de monitoramento concluído: id=%s, "
             "start=%s, end=%s, sites_processed=%d, "
@@ -232,22 +232,30 @@ class MonitoringCoordinator:
     async def _process_site(
         self,
         target_site: TargetSite,
-        brand_assets: list,
         cycle_id: str,
-    ) -> SiteResult:
-        """Processa um site individual: capture → analyze → alert.
+    ) -> tuple[SiteResult, ComplianceReport | None]:
+        """Processa um site: capture → analyze_compliance.
+
+        Fluxo:
+            1. Captura screenshot via Crawler
+            2. Armazena screenshot via ScreenshotStore
+            3. Chama compliance_analyzer.analyze_compliance()
+               → ComplianceReport
+            4. Retorna (SiteResult, ComplianceReport)
+
+        O envio de email é feito de forma consolidada no final
+        do ciclo (1 email com todos os sites).
 
         Se qualquer etapa falhar com exceção, registra o erro e
-        retorna SiteResult com success=False, permitindo que o
-        ciclo continue com os demais sites (Req 5.5).
+        retorna (SiteResult(success=False), None), permitindo que
+        o ciclo continue com os demais sites.
 
         Args:
             target_site: Site-alvo a ser processado.
-            brand_assets: Lista de ativos de marca para análise.
             cycle_id: ID do ciclo de monitoramento atual.
 
         Returns:
-            SiteResult com status de sucesso/falha e detecções.
+            Tupla (SiteResult, ComplianceReport | None).
         """
         logger.info(
             "Processando site: url=%s, id=%s",
@@ -256,7 +264,7 @@ class MonitoringCoordinator:
         )
 
         try:
-            # Etapa 1: Capture (Req 3.x)
+            # Etapa 1: Captura de screenshot
             capture_result = await self._crawler.capture(
                 target_site.url
             )
@@ -267,16 +275,21 @@ class MonitoringCoordinator:
                     target_site.url,
                     capture_result.error_message,
                 )
-                return SiteResult(
-                    target_url=target_site.url,
-                    success=False,
-                    detections=[],
-                    error_message=capture_result.error_message,
+                return (
+                    SiteResult(
+                        target_url=target_site.url,
+                        success=False,
+                        detections=[],
+                        error_message=capture_result.error_message,
+                    ),
+                    None,
                 )
 
-            # Armazena screenshot via ScreenshotStore
+            # Etapa 2: Armazena screenshot
             screenshot_model = await self._screenshot_store.store(
-                png_bytes=capture_result.screenshot_path.read_bytes(),
+                png_bytes=(
+                    capture_result.screenshot_path.read_bytes()
+                ),
                 target_site_id=target_site.id,
                 cycle_id=cycle_id,
                 height_px=capture_result.page_height_px,
@@ -284,73 +297,57 @@ class MonitoringCoordinator:
             )
             screenshot_id = screenshot_model.id
 
-            # Etapa 2: Analyze (Req 4.x)
-            if not brand_assets:
-                logger.info(
-                    "Sem brand assets para análise de %s",
-                    target_site.url,
-                )
-                return SiteResult(
+            # Etapa 3: Análise de compliance
+            report = (
+                await self._compliance_analyzer.analyze_compliance(
+                    screenshot_path=(
+                        capture_result.screenshot_path
+                    ),
                     target_url=target_site.url,
-                    success=True,
-                    detections=[],
-                )
-
-            detections = await self._analyzer.analyze(
-                screenshot_path=capture_result.screenshot_path,
-                brand_assets=brand_assets,
-                target_url=target_site.url,
-                screenshot_ref_id=screenshot_id,
-            )
-
-            # Persiste detecções no store
-            for detection in detections:
-                await self._detection_store.save(
-                    detection,
+                    screenshot_ref_id=screenshot_id,
+                    cycle_id=cycle_id,
+                    brand=target_site.brand,
                     target_site_id=target_site.id,
-                    monitoring_cycle_id=cycle_id,
                 )
-
-            # Etapa 3: Alert (Req 6.x)
-            confidence_threshold = (
-                self._config.analyzer.confidence_threshold
             )
-            recipients = self._config.alert.recipients
-
-            if recipients:
-                for detection in detections:
-                    if detection.confidence >= confidence_threshold:
-                        await self._alert_service.send_alert(
-                            detection=detection,
-                            recipients=recipients,
-                        )
 
             logger.info(
                 "Site processado com sucesso: url=%s, "
-                "detections=%d",
+                "status=%s, regras_fail=%d",
                 target_site.url,
-                len(detections),
+                report.overall_status,
+                sum(
+                    1
+                    for r in report.rule_results
+                    if r.status == "FAIL"
+                ),
             )
 
-            return SiteResult(
-                target_url=target_site.url,
-                success=True,
-                detections=detections,
+            return (
+                SiteResult(
+                    target_url=target_site.url,
+                    success=True,
+                    detections=[],
+                ),
+                report,
             )
 
         except Exception as exc:
-            # Falha isolada — não interrompe ciclo (Req 5.5)
+            # Falha isolada — não interrompe ciclo
             logger.error(
                 "Erro ao processar site %s: %s",
                 target_site.url,
                 str(exc),
                 exc_info=True,
             )
-            return SiteResult(
-                target_url=target_site.url,
-                success=False,
-                detections=[],
-                error_message=str(exc),
+            return (
+                SiteResult(
+                    target_url=target_site.url,
+                    success=False,
+                    detections=[],
+                    error_message=str(exc),
+                ),
+                None,
             )
 
     def _is_cycle_running(self) -> bool:
@@ -401,12 +398,12 @@ class MonitoringCoordinator:
         detections_found: int,
         status: str = "completed",
     ) -> None:
-        """Atualiza registro de MonitoringCycleModel com stats finais.
+        """Atualiza registro de MonitoringCycleModel com stats.
 
         Args:
             cycle_id: ID do ciclo a atualizar.
             ended_at: Timestamp de término do ciclo.
-            sites_processed: Número de sites processados com sucesso.
+            sites_processed: Número de sites com sucesso.
             sites_failed: Número de sites que falharam.
             detections_found: Total de detecções encontradas.
             status: Status final ("completed" ou "skipped").

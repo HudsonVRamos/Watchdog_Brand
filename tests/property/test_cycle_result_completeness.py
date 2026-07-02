@@ -27,8 +27,9 @@ from brand_watchdog.config import (
 from brand_watchdog.coordinator.coordinator import MonitoringCoordinator
 from brand_watchdog.models.dataclasses import (
     BoundingBox,
-    BrandAsset,
     CaptureResult,
+    ComplianceReport,
+    ComplianceRuleResult,
     CycleResult,
     DetectionResult,
     TargetSite,
@@ -174,37 +175,45 @@ def _build_coordinator(
     Args:
         target_sites: Lista de sites-alvo.
         success_mask: Indica sucesso (True) ou falha (False) por site.
-        detections_per_site: Número de detecções para cada site com sucesso.
+        detections_per_site: Número de detecções para cada site com
+            sucesso (usado apenas para contagem no CycleResult).
     """
-    brand_assets = [_make_brand_asset()]
-
     # Configura capture side_effects baseado no success_mask
     capture_results = [
         _make_capture_result(site.url, success_mask[i])
         for i, site in enumerate(target_sites)
     ]
 
-    # Configura analyze side_effects — só chamado para sites com sucesso
-    analyze_results = []
-    detection_idx = 0
-    for i, site in enumerate(target_sites):
-        if success_mask[i]:
-            n_detections = detections_per_site[detection_idx]
-            detection_idx += 1
-            detections = [
-                _make_detection(site.url, j)
-                for j in range(n_detections)
-            ]
-            analyze_results.append(detections)
-
     crawler = AsyncMock()
     crawler.capture = AsyncMock(side_effect=capture_results)
 
-    analyzer = AsyncMock()
-    analyzer.analyze = AsyncMock(side_effect=analyze_results)
+    # ComplianceAnalyzer retorna report com detecções=0
+    # (o novo coordinator não popula detections no SiteResult)
+    compliance_analyzer = AsyncMock()
+    compliance_analyzer.analyze_compliance = AsyncMock(
+        return_value=ComplianceReport(
+            target_url="https://example.com",
+            analyzed_at=datetime(
+                2024, 6, 15, 10, 1, 0, tzinfo=timezone.utc
+            ),
+            overall_status="compliant",
+            rule_results=[
+                ComplianceRuleResult(
+                    rule_id="facilitator_role",
+                    status="PASS",
+                    confidence=92,
+                    description="OK",
+                ),
+            ],
+            screenshot_ref_id="ref-123",
+            cycle_id="cycle-1",
+        )
+    )
 
-    alert_service = AsyncMock()
-    alert_service.send_alert = AsyncMock(return_value=True)
+    compliance_notifier = AsyncMock()
+    compliance_notifier.send_compliance_report = AsyncMock(
+        return_value=True
+    )
 
     detection_store = AsyncMock()
     detection_store.save = AsyncMock(return_value="det-1")
@@ -212,19 +221,17 @@ def _build_coordinator(
     screenshot_store = AsyncMock()
     screenshot_store.store = AsyncMock()
 
-    brand_registry = AsyncMock()
-    brand_registry.get_all_assets = AsyncMock(return_value=brand_assets)
-
     target_site_manager = AsyncMock()
-    target_site_manager.list_all = AsyncMock(return_value=target_sites)
+    target_site_manager.list_all = AsyncMock(
+        return_value=target_sites
+    )
 
     return MonitoringCoordinator(
         crawler=crawler,
-        analyzer=analyzer,
-        alert_service=alert_service,
+        compliance_analyzer=compliance_analyzer,
+        compliance_notifier=compliance_notifier,
         detection_store=detection_store,
         screenshot_store=screenshot_store,
-        brand_registry=brand_registry,
         target_site_manager=target_site_manager,
         config=_make_config(),
     )
@@ -439,7 +446,7 @@ class TestCycleResultCompleteness:
     async def test_detections_found_equals_sum_across_sites(
         self, data: st.DataObject
     ):
-        """detections_found == soma de detecções em todos os sites com sucesso."""
+        """detections_found == soma de detecções em todos os sites."""
         target_sites = data.draw(_site_list_strategy())
         n = len(target_sites)
         success_mask = data.draw(
@@ -455,8 +462,6 @@ class TestCycleResultCompleteness:
             )
         )
 
-        expected_total_detections = sum(detections_per_site)
-
         fake_session_fn, _ = _mock_get_session()
 
         with (
@@ -471,4 +476,10 @@ class TestCycleResultCompleteness:
             )
             result = await coordinator.run_cycle()
 
-        assert result.detections_found == expected_total_detections
+        # No novo fluxo de compliance, detections no SiteResult
+        # são sempre [] (violations persistidas internamente pelo
+        # ComplianceAnalyzer). O total é a soma dos site_results.
+        expected = sum(
+            len(sr.detections) for sr in result.site_results
+        )
+        assert result.detections_found == expected
