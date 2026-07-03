@@ -363,9 +363,9 @@ class CycleConsolidator:
     ) -> None:
         """Envia email consolidado com relatório de todos os sites do ciclo.
 
-        Busca os ComplianceReports de todos os sites processados no ciclo
-        e envia um único email com relatório em arquivo anexo.
-        Falha no envio não impede conclusão — apenas loga o erro.
+        Busca os ComplianceReports de todos os sites processados no ciclo,
+        incluindo TODAS as 6 regras (PASS e FAIL) para cada site.
+        Envia um único email com relatório em arquivo anexo.
 
         Args:
             cycle_id: ID do ciclo consolidado.
@@ -383,10 +383,13 @@ class CycleConsolidator:
             return
 
         try:
-            # Busca os reports do banco (detection_results + sites do ciclo)
             from brand_watchdog.models.dataclasses import (
+                COMPLIANCE_RULES,
                 ComplianceReport,
                 ComplianceRuleResult,
+            )
+            from brand_watchdog.models.entities import (
+                DetectionResultModel,
             )
 
             reports: list[ComplianceReport] = []
@@ -414,10 +417,7 @@ class CycleConsolidator:
                     if target_site is None:
                         continue
 
-                    # Busca detection_results para este site/ciclo
-                    from brand_watchdog.models.entities import (
-                        DetectionResultModel,
-                    )
+                    # Busca detection_results (violações FAIL) para este site/ciclo
                     det_stmt = select(DetectionResultModel).where(
                         DetectionResultModel.target_site_id == site_result.site_id,
                         DetectionResultModel.monitoring_cycle_id == cycle_id,
@@ -425,19 +425,36 @@ class CycleConsolidator:
                     det_result = await session.execute(det_stmt)
                     detections = det_result.scalars().all()
 
-                    # Monta rule_results a partir das detecções
-                    rule_results = [
-                        ComplianceRuleResult(
-                            rule_id=d.match_type or "unknown",
-                            status="FAIL",
-                            confidence=d.confidence or 0,
-                            description=d.description or "",
-                        )
-                        for d in detections
-                    ]
+                    # Monta mapa de regras FAIL (rule_id -> detection)
+                    fail_map = {
+                        d.match_type: d for d in detections
+                    }
+
+                    # Constrói TODAS as 6 regras (PASS ou FAIL)
+                    rule_results = []
+                    for rule_id in COMPLIANCE_RULES:
+                        if rule_id in fail_map:
+                            d = fail_map[rule_id]
+                            rule_results.append(
+                                ComplianceRuleResult(
+                                    rule_id=rule_id,
+                                    status="FAIL",
+                                    confidence=d.confidence or 0,
+                                    description=d.description or "",
+                                )
+                            )
+                        else:
+                            rule_results.append(
+                                ComplianceRuleResult(
+                                    rule_id=rule_id,
+                                    status="PASS",
+                                    confidence=100,
+                                    description="Em conformidade.",
+                                )
+                            )
 
                     overall_status = (
-                        "non_compliant" if rule_results else "compliant"
+                        "non_compliant" if fail_map else "compliant"
                     )
 
                     report = ComplianceReport(

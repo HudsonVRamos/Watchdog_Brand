@@ -58,6 +58,7 @@ from brand_watchdog.models.database import (
 from brand_watchdog.models.entities import SiteCycleResultModel
 from brand_watchdog.queue.consumer import SQSConsumer
 from brand_watchdog.queue.messages import ProcessingMessage
+from brand_watchdog.storage.detection_store import DetectionStore
 from brand_watchdog.storage.screenshot_store import ScreenshotStore
 
 logger = logging.getLogger(__name__)
@@ -137,10 +138,12 @@ class WorkerMain:
             config=self._config.storage,
         )
 
-        # Compliance Analyzer
+        # Compliance Analyzer (com DetectionStore para persistir violações)
+        detection_store = DetectionStore()
         self._compliance_analyzer = ComplianceAnalyzer(
             config=self._config.analyzer,
             storage_config=self._config.storage,
+            detection_store=detection_store,
         )
 
         # Prompt Builder (para build_prompt_cached com referências)
