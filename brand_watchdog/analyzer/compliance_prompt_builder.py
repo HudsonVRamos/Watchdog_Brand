@@ -355,7 +355,21 @@ class CompliancePromptBuilder:
     def _response_format_section(self) -> str:
         """Seção de formato de resposta JSON (igual para ambos brands)."""
         return (
-            "\n\n## FORMATO DE RESPOSTA\n\n"
+            "\n\n## REGRA CRÍTICA: NÃO ALUCINAR\n\n"
+            "ANTES de avaliar qualquer regra, verifique se o screenshot "
+            "contém ALGUMA menção visível e clara a:\n"
+            "- Amazon Prime, Prime Video, Amazon Music, Prime Gaming, Prime Reading\n"
+            "- SKY+ (ou DGO)\n"
+            "- Logos da parceria SKY+/Amazon (ou DGO/Amazon)\n\n"
+            "Se NÃO encontrar NENHUMA dessas menções no screenshot, "
+            "TODAS as 6 regras devem ser NOT_APPLICABLE com a descrição: "
+            "'Nenhum conteúdo relacionado à parceria SKY+/Amazon Prime "
+            "foi encontrado no screenshot. O site não exibe material "
+            "da parceria.'\n\n"
+            "NÃO invente ou assuma conteúdo que não está CLARAMENTE "
+            "visível no screenshot. Só marque FAIL se você conseguir "
+            "apontar EXATAMENTE onde no screenshot está a violação.\n\n"
+            "## FORMATO DE RESPOSTA\n\n"
             "Responda EXCLUSIVAMENTE em JSON válido, sem "
             "markdown, com a seguinte estrutura:\n\n"
             "```json\n"
@@ -381,7 +395,12 @@ class CompliancePromptBuilder:
             "5. naming_pricing\n"
             "6. kv_integrity\n\n"
             "Use NOT_APPLICABLE quando a regra não se "
-            "aplica ao conteúdo visível no screenshot."
+            "aplica ao conteúdo visível no screenshot.\n\n"
+            "IMPORTANTE: Na descrição, sempre indique se "
+            "encontrou ou não conteúdo da parceria no site. "
+            "Se PASS, explique O QUE foi encontrado e por que "
+            "está correto. Se NOT_APPLICABLE, confirme que "
+            "nenhum material da parceria foi detectado."
         )
 
     def _section_facilitator_role(self) -> str:
