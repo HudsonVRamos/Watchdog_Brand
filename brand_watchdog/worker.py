@@ -511,14 +511,15 @@ class WorkerMain:
 
         # 3. Resize do screenshot para respeitar limites do Bedrock
         #    (max 8000px de dimensão, max ~4.5MB de payload)
-        png_bytes_for_analysis = self._resize_for_bedrock(png_bytes)
+        analysis_bytes, is_jpeg = self._resize_for_bedrock(png_bytes)
 
         # Escrever imagem resized em arquivo temporário para o analyzer
+        suffix = ".jpeg" if is_jpeg else ".png"
         tmp_screenshot_path = Path(
-            tempfile.mktemp(suffix=".png", prefix="bw_resize_")
+            tempfile.mktemp(suffix=suffix, prefix="bw_resize_")
         )
         try:
-            tmp_screenshot_path.write_bytes(png_bytes_for_analysis)
+            tmp_screenshot_path.write_bytes(analysis_bytes)
 
             # 4. Análise de compliance via Bedrock
             #    Usa imagens cacheadas do ReferenceImageCache (Req 8.2)
@@ -696,7 +697,7 @@ class WorkerMain:
                 storage_config=self._config.storage,
             )
 
-    def _resize_for_bedrock(self, png_bytes: bytes) -> bytes:
+    def _resize_for_bedrock(self, png_bytes: bytes) -> tuple[bytes, bool]:
         """Redimensiona screenshot para respeitar limites do Bedrock.
 
         Limites da API Bedrock/Anthropic:
@@ -711,10 +712,12 @@ class WorkerMain:
             png_bytes: Bytes originais do screenshot PNG.
 
         Returns:
-            Bytes da imagem redimensionada (PNG ou JPEG).
+            Tupla (bytes da imagem, is_jpeg) indicando se foi
+            convertida para JPEG.
         """
         max_dim = 8000
         max_size_bytes = 4_500_000
+        is_jpeg = False
 
         try:
             img = Image.open(io.BytesIO(png_bytes))
@@ -723,7 +726,7 @@ class WorkerMain:
                 "Não foi possível abrir imagem para resize: %s",
                 str(exc),
             )
-            return png_bytes
+            return png_bytes, False
 
         # Redimensionar se dimensões excedem 8000px
         if img.width > max_dim or img.height > max_dim:
@@ -751,13 +754,14 @@ class WorkerMain:
             buf = io.BytesIO()
             img.save(buf, format="JPEG", quality=80)
             png_bytes = buf.getvalue()
+            is_jpeg = True
             logger.info(
                 "Screenshot convertido para JPEG (quality=80) "
                 "para Bedrock: %d bytes",
                 len(png_bytes),
             )
 
-        return png_bytes
+        return png_bytes, is_jpeg
 
 
 def _handle_signal(worker: WorkerMain) -> None:
