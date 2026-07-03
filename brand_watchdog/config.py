@@ -32,7 +32,7 @@ class AnalyzerConfig:
 
     bedrock_model_id: str = "us.anthropic.claude-sonnet-4-6"
     bedrock_region: str = "us-east-1"
-    confidence_threshold: int = 70
+    confidence_threshold: int = 80
     request_timeout_seconds: int = 60
     max_retries: int = 3
     retry_base_delay_seconds: float = 2.0

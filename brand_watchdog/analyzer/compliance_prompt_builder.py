@@ -355,7 +355,8 @@ class CompliancePromptBuilder:
     def _response_format_section(self) -> str:
         """Seção de formato de resposta JSON (igual para ambos brands)."""
         return (
-            "\n\n## REGRA CRÍTICA: NÃO ALUCINAR\n\n"
+            "\n\n## REGRA CRÍTICA: PRECISÃO E CONSERVADORISMO\n\n"
+            "### 1. NÃO ALUCINAR\n"
             "ANTES de avaliar qualquer regra, verifique se o screenshot "
             "contém ALGUMA menção visível e clara a:\n"
             "- Amazon Prime, Prime Video, Amazon Music, Prime Gaming, Prime Reading\n"
@@ -364,12 +365,28 @@ class CompliancePromptBuilder:
             "Se NÃO encontrar NENHUMA dessas menções no screenshot, "
             "TODAS as 6 regras devem ser NOT_APPLICABLE com a descrição: "
             "'Nenhum conteúdo relacionado à parceria SKY+/Amazon Prime "
-            "foi encontrado no screenshot. O site não exibe material "
-            "da parceria.'\n\n"
-            "NÃO invente ou assuma conteúdo que não está CLARAMENTE "
-            "visível no screenshot. Só marque FAIL se você conseguir "
-            "apontar EXATAMENTE onde no screenshot está a violação.\n\n"
-            "## FORMATO DE RESPOSTA\n\n"
+            "foi encontrado no screenshot.'\n\n"
+            "### 2. SER CONSERVADOR NOS FAILS\n"
+            "Só marque FAIL quando tiver CERTEZA ABSOLUTA da violação. "
+            "Se houver QUALQUER dúvida, marque PASS com confidence baixa "
+            "e explique a incerteza na descrição.\n\n"
+            "Regras de rigor para FAIL:\n"
+            "- Confidence MÍNIMA para FAIL: 80%. Se não tem 80%+ de certeza, "
+            "é PASS (com nota na descrição).\n"
+            "- Deve apontar EXATAMENTE o que viu no screenshot (texto literal, "
+            "posição na página, elemento visual específico).\n"
+            "- NÃO confundir nome do PLANO DE INTERNET do ISP (ex: 'Combo Prime') "
+            "com o nome do SERVIÇO Amazon. O nome do plano do ISP pode ser qualquer "
+            "coisa. A regra naming_pricing se aplica apenas ao nome do SERVIÇO "
+            "Amazon/SKY+ (ex: deve ser 'SKY+ com Amazon Prime incluso').\n"
+            "- NÃO marcar logo_effects como FAIL apenas por logos estarem "
+            "em tamanho pequeno ou sobre fundo colorido. FAIL é apenas para "
+            "efeitos CLARAMENTE indevidos: filtros de cor, sombras grossas, "
+            "distorção, ou brilho aplicado SOBRE o logo.\n"
+            "- NÃO marcar logo_application como FAIL se os logos estão "
+            "separados por barra vertical e com espaçamento, mesmo que "
+            "a ordem não seja perfeita.\n\n"
+            "### 3. FORMATO DE RESPOSTA\n\n"
             "Responda EXCLUSIVAMENTE em JSON válido, sem "
             "markdown, com a seguinte estrutura:\n\n"
             "```json\n"
@@ -380,8 +397,9 @@ class CompliancePromptBuilder:
             '      "status": "PASS" | "FAIL" | '
             '"NOT_APPLICABLE",\n'
             '      "confidence": <integer 0-100>,\n'
-            '      "description": "<descrição dos achados '
-            'em até 1024 caracteres>"\n'
+            '      "description": "<descrição PRECISA dos achados, '
+            "citando texto literal ou elementos visuais ESPECÍFICOS "
+            'vistos no screenshot, em até 1024 caracteres>"\n'
             "    }\n"
             "  ]\n"
             "}\n"
@@ -396,11 +414,12 @@ class CompliancePromptBuilder:
             "6. kv_integrity\n\n"
             "Use NOT_APPLICABLE quando a regra não se "
             "aplica ao conteúdo visível no screenshot.\n\n"
-            "IMPORTANTE: Na descrição, sempre indique se "
-            "encontrou ou não conteúdo da parceria no site. "
-            "Se PASS, explique O QUE foi encontrado e por que "
-            "está correto. Se NOT_APPLICABLE, confirme que "
-            "nenhum material da parceria foi detectado."
+            "Na descrição, SEMPRE indique:\n"
+            "- Se PASS: O QUE foi encontrado e por que está correto.\n"
+            "- Se NOT_APPLICABLE: Confirme que nenhum material da parceria "
+            "foi detectado no screenshot.\n"
+            "- Se FAIL: Cite o TEXTO LITERAL ou ELEMENTO VISUAL EXATO "
+            "que constitui a violação, com localização na página."
         )
 
     def _section_facilitator_role(self) -> str:
