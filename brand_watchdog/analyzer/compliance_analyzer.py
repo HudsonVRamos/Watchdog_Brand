@@ -164,13 +164,66 @@ class ComplianceAnalyzer:
             ),
         )
 
-        # 4. Persistir violações (regras FAIL)
+        # 4. Persistir TODAS as regras (PASS, FAIL, NOT_APPLICABLE)
         if self._detection_store is not None:
-            await self._persist_violations(
+            await self._persist_all_rules(
                 report, target_site_id or target_url, screenshot_ref_id, cycle_id
             )
 
         return report
+
+    async def _persist_all_rules(
+        self,
+        report: ComplianceReport,
+        target_url: str,
+        screenshot_ref_id: str,
+        cycle_id: str,
+    ) -> None:
+        """Persiste TODAS as regras (PASS, FAIL, NOT_APPLICABLE) como DetectionResult.
+
+        Salva cada regra do ComplianceReport para que o relatório
+        consolidado tenha acesso às descrições completas do Bedrock,
+        permitindo distinguir entre "compliant com marca presente"
+        e "sem conteúdo da marca detectado".
+
+        Args:
+            report: ComplianceReport com resultados das regras.
+            target_url: ID do target site ou URL.
+            screenshot_ref_id: ID de referência do screenshot.
+            cycle_id: ID do ciclo de monitoramento.
+        """
+        retention_days = self._storage_config.detection_retention_days
+
+        for rule in report.rule_results:
+            detection = DetectionResult(
+                target_url=target_url,
+                match_type=rule.rule_id,
+                confidence=rule.confidence,
+                bounding_box=BoundingBox(
+                    x_percent=0.0,
+                    y_percent=0.0,
+                    width_percent=0.0,
+                    height_percent=0.0,
+                ),
+                description=f"[{rule.status}] {rule.description}",
+                detected_at=report.analyzed_at,
+                screenshot_ref_id=screenshot_ref_id,
+            )
+
+            try:
+                await self._save_with_retry(
+                    detection, target_url, cycle_id, retention_days
+                )
+            except Exception as exc:
+                # Não interromper por falha em regra PASS/NOT_APPLICABLE
+                if rule.status == "FAIL":
+                    raise
+                logger.debug(
+                    "Falha ao persistir regra %s (status=%s): %s",
+                    rule.rule_id,
+                    rule.status,
+                    str(exc),
+                )
 
     async def _persist_violations(
         self,

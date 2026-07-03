@@ -440,7 +440,8 @@ class CycleConsolidator:
                         reports.append(report)
                         continue
 
-                    # Busca detection_results (violações FAIL) para este site/ciclo
+                    # Busca TODAS as detection_results para este site/ciclo
+                    # (agora inclui PASS, FAIL e NOT_APPLICABLE com descrições do Bedrock)
                     det_stmt = select(DetectionResultModel).where(
                         DetectionResultModel.target_site_id == site_result.site_id,
                         DetectionResultModel.monitoring_cycle_id == cycle_id,
@@ -448,22 +449,39 @@ class CycleConsolidator:
                     det_result = await session.execute(det_stmt)
                     detections = det_result.scalars().all()
 
-                    # Monta mapa de regras FAIL (rule_id -> detection)
-                    fail_map = {
+                    # Monta mapa de regras (rule_id -> detection)
+                    det_map = {
                         d.match_type: d for d in detections
                     }
 
-                    # Constrói TODAS as 6 regras (PASS ou FAIL)
+                    # Constrói TODAS as 6 regras usando descrições reais do Bedrock
                     rule_results = []
+                    has_fail = False
                     for rule_id in COMPLIANCE_RULES:
-                        if rule_id in fail_map:
-                            d = fail_map[rule_id]
+                        if rule_id in det_map:
+                            d = det_map[rule_id]
+                            desc = d.description or ""
+                            # Extrair status do prefixo [STATUS] na descrição
+                            if desc.startswith("[FAIL]"):
+                                status = "FAIL"
+                                desc = desc[6:].strip()
+                                has_fail = True
+                            elif desc.startswith("[NOT_APPLICABLE]"):
+                                status = "NOT_APPLICABLE"
+                                desc = desc[16:].strip()
+                            elif desc.startswith("[PASS]"):
+                                status = "PASS"
+                                desc = desc[6:].strip()
+                            else:
+                                # Fallback: se não tem prefixo, é FAIL (legado)
+                                status = "FAIL"
+                                has_fail = True
                             rule_results.append(
                                 ComplianceRuleResult(
                                     rule_id=rule_id,
-                                    status="FAIL",
+                                    status=status,
                                     confidence=d.confidence or 0,
-                                    description=d.description or "",
+                                    description=desc,
                                 )
                             )
                         else:
@@ -472,12 +490,12 @@ class CycleConsolidator:
                                     rule_id=rule_id,
                                     status="PASS",
                                     confidence=100,
-                                    description="Em conformidade.",
+                                    description="Sem dados de análise disponíveis.",
                                 )
                             )
 
                     overall_status = (
-                        "non_compliant" if fail_map else "compliant"
+                        "non_compliant" if has_fail else "compliant"
                     )
 
                     report = ComplianceReport(
