@@ -139,7 +139,7 @@ class WorkerMain:
         )
 
         # Compliance Analyzer (com DetectionStore para persistir violações)
-        detection_store = DetectionStore()
+        detection_store = DetectionStore(config=self._config.storage)
         self._compliance_analyzer = ComplianceAnalyzer(
             config=self._config.analyzer,
             storage_config=self._config.storage,
