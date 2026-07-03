@@ -395,12 +395,11 @@ class CycleConsolidator:
             reports: list[ComplianceReport] = []
 
             async with get_session() as session:
-                # Busca resultados com sucesso para este ciclo
+                # Busca TODOS os resultados para este ciclo (success + failure)
                 stmt = (
                     select(SiteCycleResultModel)
                     .where(
                         SiteCycleResultModel.cycle_id == cycle_id,
-                        SiteCycleResultModel.status == "success",
                     )
                 )
                 result = await session.execute(stmt)
@@ -415,6 +414,30 @@ class CycleConsolidator:
                     target_site = site_row.scalar_one_or_none()
 
                     if target_site is None:
+                        continue
+
+                    # Se o site falhou no processamento, reportar como erro
+                    if site_result.status == "failure":
+                        rule_results = [
+                            ComplianceRuleResult(
+                                rule_id="processing_error",
+                                status="FAIL",
+                                confidence=0,
+                                description=(
+                                    site_result.failure_reason
+                                    or "Erro no processamento"
+                                ),
+                            )
+                        ]
+                        report = ComplianceReport(
+                            target_url=target_site.url,
+                            analyzed_at=site_result.completed_at,
+                            overall_status="error",
+                            rule_results=rule_results,
+                            screenshot_ref_id="",
+                            cycle_id=cycle_id,
+                        )
+                        reports.append(report)
                         continue
 
                     # Busca detection_results (violações FAIL) para este site/ciclo
