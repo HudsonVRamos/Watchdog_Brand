@@ -7,15 +7,18 @@ Valida:
 - Conteúdo obrigatório no email (URL, timestamp, status, regras)
 - Retry logic: falha nas primeiras N-1 tentativas, sucesso na N-ésima
 - Exatamente 1 email por ISP por ciclo por destinatário
+- Integração Excel: anexos MIME, graceful degradation, tamanho
 
-Validates: Requirements 8.1, 8.2, 8.3, 8.5, 8.6
+Validates: Requirements 8.1, 8.2, 8.3, 8.5, 8.6, 4.1, 4.2, 4.3, 4.4, 5.3
 """
 
 from __future__ import annotations
 
-import asyncio
+import logging
+import re
 from datetime import datetime, timezone
-from unittest.mock import AsyncMock, patch
+from email import message_from_string
+from unittest.mock import patch
 
 import pytest
 
@@ -820,4 +823,314 @@ class TestOneEmailPerIspPerCycle:
         assert len(delivered_emails) == 1
         assert (
             delivered_emails[0]["recipient"] == "user@example.com"
+        )
+
+
+# --- Testes de Integração Excel no send_cycle_report ---
+
+
+class TestSendCycleReportExcelIntegration:
+    """Testes da integração Excel no envio de relatório de ciclo.
+
+    Verifica que o email MIME enviado via SES inclui os anexos
+    corretos (.txt e .xlsx), com graceful degradation e controle
+    de tamanho.
+
+    Validates: Requirements 4.1, 4.2, 4.3, 4.4, 5.3
+    """
+
+    @pytest.mark.asyncio
+    async def test_send_cycle_report_includes_both_txt_and_xlsx_attachments(
+        self,
+    ) -> None:
+        """Email inclui ambos anexos .txt e .xlsx quando geração OK.
+
+        Validates: Requirements 4.1
+        """
+        config = _make_config(
+            retry_attempts=1, retry_interval_seconds=0
+        )
+        provider = FakeEmailProvider()
+        notifier = ComplianceEmailNotifier(config, provider)
+        reports = [_make_compliant_report()]
+
+        with patch("boto3.client") as mock_client:
+            mock_ses = mock_client.return_value
+            mock_ses.send_raw_email.return_value = {
+                "MessageId": "test-id-123"
+            }
+
+            result = await notifier.send_cycle_report(
+                reports, ["user@example.com"]
+            )
+
+        assert result is True
+
+        # Extrair mensagem MIME raw
+        call_args = mock_ses.send_raw_email.call_args
+        raw_message = call_args[1]["RawMessage"]["Data"]
+        msg = message_from_string(raw_message)
+
+        # Coletar attachments
+        attachments = []
+        for part in msg.walk():
+            content_disp = part.get("Content-Disposition", "")
+            if "attachment" in content_disp:
+                attachments.append(part)
+
+        # Deve ter 2 anexos: .txt e .xlsx
+        assert len(attachments) == 2
+
+        filenames = [
+            part.get_filename() for part in attachments
+        ]
+        txt_files = [f for f in filenames if f.endswith(".txt")]
+        xlsx_files = [
+            f for f in filenames if f.endswith(".xlsx")
+        ]
+
+        assert len(txt_files) == 1
+        assert len(xlsx_files) == 1
+
+    @pytest.mark.asyncio
+    async def test_send_cycle_report_graceful_degradation_on_excel_failure(
+        self,
+    ) -> None:
+        """Email enviado com apenas .txt quando geração Excel falha.
+
+        Validates: Requirements 4.3, 5.3
+        """
+        config = _make_config(
+            retry_attempts=1, retry_interval_seconds=0
+        )
+        provider = FakeEmailProvider()
+        notifier = ComplianceEmailNotifier(config, provider)
+        reports = [_make_compliant_report()]
+
+        with (
+            patch("boto3.client") as mock_client,
+            patch(
+                "brand_watchdog.alerts.compliance_email_notifier"
+                ".ExcelComplianceReportGenerator.generate",
+                side_effect=RuntimeError(
+                    "Falha simulada na geração Excel"
+                ),
+            ),
+        ):
+            mock_ses = mock_client.return_value
+            mock_ses.send_raw_email.return_value = {
+                "MessageId": "test-id-456"
+            }
+
+            result = await notifier.send_cycle_report(
+                reports, ["user@example.com"]
+            )
+
+        assert result is True
+
+        # Extrair mensagem MIME raw
+        call_args = mock_ses.send_raw_email.call_args
+        raw_message = call_args[1]["RawMessage"]["Data"]
+        msg = message_from_string(raw_message)
+
+        # Coletar attachments
+        attachments = []
+        for part in msg.walk():
+            content_disp = part.get("Content-Disposition", "")
+            if "attachment" in content_disp:
+                attachments.append(part)
+
+        # Deve ter apenas 1 anexo: .txt (sem .xlsx)
+        assert len(attachments) == 1
+
+        filename = attachments[0].get_filename()
+        assert filename.endswith(".txt")
+
+    @pytest.mark.asyncio
+    async def test_send_cycle_report_omits_excel_when_size_exceeds_limit(
+        self,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Excel omitido quando tamanho total excede 10 MB, com warning.
+
+        Validates: Requirements 4.4
+        """
+        config = _make_config(
+            retry_attempts=1, retry_interval_seconds=0
+        )
+        provider = FakeEmailProvider()
+        notifier = ComplianceEmailNotifier(config, provider)
+        reports = [_make_compliant_report()]
+
+        # Simular Excel de ~11 MB
+        large_excel_bytes = b"x" * (11 * 1024 * 1024)
+
+        with (
+            patch("boto3.client") as mock_client,
+            patch(
+                "brand_watchdog.alerts.compliance_email_notifier"
+                ".ExcelComplianceReportGenerator.generate",
+                return_value=large_excel_bytes,
+            ),
+            caplog.at_level(logging.WARNING),
+        ):
+            mock_ses = mock_client.return_value
+            mock_ses.send_raw_email.return_value = {
+                "MessageId": "test-id-789"
+            }
+
+            result = await notifier.send_cycle_report(
+                reports, ["user@example.com"]
+            )
+
+        assert result is True
+
+        # Verificar warning logado sobre tamanho
+        warning_msgs = [
+            r.message
+            for r in caplog.records
+            if r.levelno == logging.WARNING
+        ]
+        assert any(
+            "excede limite de 10 MB" in msg
+            or "tamanho total" in msg
+            for msg in warning_msgs
+        ), f"Warning esperado não encontrado: {warning_msgs}"
+
+        # Extrair mensagem MIME raw — deve ter apenas .txt
+        call_args = mock_ses.send_raw_email.call_args
+        raw_message = call_args[1]["RawMessage"]["Data"]
+        msg = message_from_string(raw_message)
+
+        attachments = []
+        for part in msg.walk():
+            content_disp = part.get("Content-Disposition", "")
+            if "attachment" in content_disp:
+                attachments.append(part)
+
+        assert len(attachments) == 1
+        filename = attachments[0].get_filename()
+        assert filename.endswith(".txt")
+
+    @pytest.mark.asyncio
+    async def test_send_cycle_report_xlsx_and_txt_share_same_timestamp(
+        self,
+    ) -> None:
+        """Ambos anexos (.txt e .xlsx) compartilham mesmo timestamp.
+
+        O pattern é compliance_report_YYYYMMDD_HHMMSS.{ext}
+
+        Validates: Requirements 4.2
+        """
+        config = _make_config(
+            retry_attempts=1, retry_interval_seconds=0
+        )
+        provider = FakeEmailProvider()
+        notifier = ComplianceEmailNotifier(config, provider)
+        reports = [_make_compliant_report()]
+
+        with patch("boto3.client") as mock_client:
+            mock_ses = mock_client.return_value
+            mock_ses.send_raw_email.return_value = {
+                "MessageId": "test-id-ts"
+            }
+
+            result = await notifier.send_cycle_report(
+                reports, ["user@example.com"]
+            )
+
+        assert result is True
+
+        # Extrair mensagem MIME raw
+        call_args = mock_ses.send_raw_email.call_args
+        raw_message = call_args[1]["RawMessage"]["Data"]
+        msg = message_from_string(raw_message)
+
+        # Coletar filenames dos attachments
+        filenames = []
+        for part in msg.walk():
+            content_disp = part.get("Content-Disposition", "")
+            if "attachment" in content_disp:
+                fname = part.get_filename()
+                if fname:
+                    filenames.append(fname)
+
+        assert len(filenames) == 2
+
+        # Extrair timestamps dos filenames
+        # Pattern: compliance_report_YYYYMMDD_HHMMSS.ext
+        timestamp_pattern = re.compile(
+            r"compliance_report_(\d{8}_\d{6})\.\w+"
+        )
+        timestamps = []
+        for fname in filenames:
+            match = timestamp_pattern.match(fname)
+            assert match is not None, (
+                f"Filename '{fname}' não segue pattern esperado"
+            )
+            timestamps.append(match.group(1))
+
+        # Ambos devem ter o mesmo timestamp
+        assert timestamps[0] == timestamps[1], (
+            f"Timestamps diferentes: {timestamps[0]} vs "
+            f"{timestamps[1]}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_send_cycle_report_xlsx_mime_content_type_is_correct(
+        self,
+    ) -> None:
+        """Anexo .xlsx possui content-type MIME correto.
+
+        O content-type deve ser:
+        application/vnd.openxmlformats-officedocument.spreadsheetml.sheet
+
+        Validates: Requirements 4.1
+        """
+        config = _make_config(
+            retry_attempts=1, retry_interval_seconds=0
+        )
+        provider = FakeEmailProvider()
+        notifier = ComplianceEmailNotifier(config, provider)
+        reports = [_make_compliant_report()]
+
+        with patch("boto3.client") as mock_client:
+            mock_ses = mock_client.return_value
+            mock_ses.send_raw_email.return_value = {
+                "MessageId": "test-id-mime"
+            }
+
+            result = await notifier.send_cycle_report(
+                reports, ["user@example.com"]
+            )
+
+        assert result is True
+
+        # Extrair mensagem MIME raw
+        call_args = mock_ses.send_raw_email.call_args
+        raw_message = call_args[1]["RawMessage"]["Data"]
+        msg = message_from_string(raw_message)
+
+        # Encontrar o part .xlsx e verificar content-type
+        xlsx_part = None
+        for part in msg.walk():
+            content_disp = part.get("Content-Disposition", "")
+            if "attachment" in content_disp:
+                fname = part.get_filename()
+                if fname and fname.endswith(".xlsx"):
+                    xlsx_part = part
+                    break
+
+        assert xlsx_part is not None, (
+            "Anexo .xlsx não encontrado na mensagem MIME"
+        )
+
+        content_type = xlsx_part.get_content_type()
+        expected_type = (
+            "application/vnd.openxmlformats-officedocument"
+            ".spreadsheetml.sheet"
+        )
+        assert content_type == expected_type, (
+            f"Content-type incorreto: '{content_type}' "
+            f"(esperado: '{expected_type}')"
         )
