@@ -17,6 +17,9 @@ from datetime import timezone
 from brand_watchdog.alerts.alert_service import EmailProvider
 from brand_watchdog.config import AlertConfig
 from brand_watchdog.models.dataclasses import ComplianceReport
+from brand_watchdog.reports.excel_compliance_report_generator import (
+    ExcelComplianceReportGenerator,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -80,12 +83,34 @@ class ComplianceEmailNotifier:
             self._format_cycle_email_with_attachment(reports)
         )
 
+        # Gerar Excel (graceful degradation)
+        excel_bytes: bytes | None = None
+        try:
+            generator = ExcelComplianceReportGenerator()
+            excel_bytes = generator.generate(reports)
+        except Exception as exc:
+            logger.warning(
+                "Falha ao gerar relatório Excel: %s", str(exc)
+            )
+
+        # Verificar tamanho total antes de enviar
+        if excel_bytes is not None:
+            txt_size = len(attachment_content.encode("utf-8"))
+            total_size = txt_size + len(excel_bytes)
+            if total_size > 10 * 1024 * 1024:  # 10 MB
+                logger.warning(
+                    "Anexo Excel omitido: tamanho total %d bytes "
+                    "excede limite de 10 MB",
+                    total_size,
+                )
+                excel_bytes = None
+
         # Enviar com anexo via raw email
         at_least_one_success = False
         for recipient in recipients:
             success = await self._send_with_attachment(
                 recipient, subject, body_summary,
-                attachment_content,
+                attachment_content, excel_bytes,
             )
             if success:
                 at_least_one_success = True
@@ -308,14 +333,16 @@ class ComplianceEmailNotifier:
         subject: str,
         body: str,
         attachment_content: str,
+        excel_bytes: bytes | None = None,
     ) -> bool:
-        """Envia email com arquivo .txt anexado via raw MIME.
+        """Envia email com arquivo(s) anexado(s) via raw MIME.
 
         Args:
             recipient: Endereço do destinatário.
             subject: Assunto do email.
             body: Corpo resumido do email.
             attachment_content: Conteúdo do arquivo .txt anexado.
+            excel_bytes: Bytes do .xlsx (None se geração falhou).
 
         Returns:
             True se envio bem-sucedido, False se falhou.
@@ -356,6 +383,24 @@ class ComplianceEmailNotifier:
             filename=filename,
         )
         msg.attach(attachment)
+
+        # Anexo .xlsx (quando disponível)
+        if excel_bytes is not None:
+            xlsx_filename = (
+                f"compliance_report_"
+                f"{now.strftime('%Y%m%d_%H%M%S')}.xlsx"
+            )
+            xlsx_attachment = MIMEApplication(
+                excel_bytes,
+                _subtype="vnd.openxmlformats-officedocument"
+                ".spreadsheetml.sheet",
+            )
+            xlsx_attachment.add_header(
+                "Content-Disposition",
+                "attachment",
+                filename=xlsx_filename,
+            )
+            msg.attach(xlsx_attachment)
 
         # Enviar via SES raw email com retry
         ses_client = boto3.client(
@@ -537,6 +582,9 @@ class ComplianceEmailNotifier:
             body_parts.append(
                 f"  {rule.rule_id}: {rule.status} "
                 f"(confidence: {rule.confidence}%)"
+            )
+            body_parts.append(
+                f"    {rule.description}"
             )
         body_parts.append("")
 

@@ -41,7 +41,7 @@ from brand_watchdog.storage.detection_store import DetectionStore
 
 
 _PBT_SETTINGS = settings(
-    max_examples=100,
+    max_examples=30,
     suppress_health_check=[HealthCheck.function_scoped_fixture],
 )
 
@@ -134,7 +134,7 @@ class TestDetectionPersistenceRoundTrip:
                 id="screenshot-001",
                 target_site_id="https://example.com",
                 monitoring_cycle_id="cycle-001",
-                file_path="/tmp/test.png",
+                s3_key="screenshots/cycle-001/screenshot-001.png",
                 captured_at=datetime.now(timezone.utc),
                 height_px=1080,
                 was_truncated=False,

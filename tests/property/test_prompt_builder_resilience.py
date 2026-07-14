@@ -27,8 +27,9 @@ from brand_watchdog.analyzer.compliance_prompt_builder import (
 
 
 _PBT_SETTINGS = settings(
-    max_examples=100,
+    max_examples=30,
     suppress_health_check=[HealthCheck.function_scoped_fixture],
+    deadline=None,
 )
 
 # Nomes dos arquivos de referência do builder

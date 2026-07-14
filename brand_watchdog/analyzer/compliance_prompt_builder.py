@@ -30,12 +30,21 @@ class PromptPayload:
 
     Attributes:
         images: Lista de tuplas (image_bytes, label) na ordem:
-            [screenshot, ...reference_images]
+            [screenshot, ...reference_images] (build_prompt) ou
+            [...reference_images, screenshot] (build_prompt_cached).
         prompt_text: Texto completo do prompt com regras de compliance.
+        cache_control_index: Índice do último bloco estático na
+            lista de imagens (para marcação cache_control ephemeral).
+            None quando Prompt Caching não está habilitado.
+        media_types: Lista de media_types correspondente a cada
+            imagem em images. None quando não especificado
+            (backward compatibility com build_prompt).
     """
 
     images: list[tuple[bytes, str]]  # (image_bytes, label)
     prompt_text: str
+    cache_control_index: int | None = None
+    media_types: list[str] | None = None
 
 
 # Mapeamento de imagens de referência por brand
@@ -127,6 +136,76 @@ class CompliancePromptBuilder:
         prompt_text = self._build_rules_text()
 
         return PromptPayload(images=images, prompt_text=prompt_text)
+
+    def build_prompt_cached(
+        self,
+        screenshot_bytes: bytes,
+        reference_images: list[tuple[bytes, str]] | None = None,
+    ) -> PromptPayload:
+        """Constrói payload otimizado para Prompt Caching do Bedrock.
+
+        Organiza o payload com conteúdo estático (regras + imagens de
+        referência) ANTES do conteúdo variável (screenshot), permitindo
+        que o Bedrock reutilize o prefixo entre chamadas consecutivas.
+
+        As imagens de referência são recebidas já em bytes (JPEG, do
+        ReferenceImageCache) e o screenshot é recebido diretamente
+        como bytes (PNG).
+
+        Args:
+            screenshot_bytes: Bytes do screenshot (formato PNG).
+            reference_images: Lista de tuplas (image_bytes, label)
+                com imagens de referência já processadas pelo
+                ReferenceImageCache (formato JPEG). Se None ou
+                vazia, o payload contém apenas o screenshot.
+
+        Returns:
+            PromptPayload com imagens ordenadas para Prompt Caching:
+            - Imagens de referência (estáticas, JPEG) primeiro
+            - Screenshot (variável, PNG) por último
+            - cache_control_index apontando para o último bloco
+              estático (última referência)
+            - media_types indicando o formato de cada imagem
+
+        Raises:
+            AnalysisIncompleteError: Se screenshot_bytes estiver vazio.
+        """
+        if not screenshot_bytes:
+            raise AnalysisIncompleteError(
+                "Screenshot vazio ou ilegível (bytes vazios)"
+            )
+
+        # Montar lista de imagens: ESTÁTICAS primeiro, VARIÁVEL depois
+        images: list[tuple[bytes, str]] = []
+        media_types: list[str] = []
+
+        # Referências primeiro (estáticas, JPEG)
+        if reference_images:
+            for ref_bytes, ref_label in reference_images:
+                images.append((ref_bytes, ref_label))
+                media_types.append("image/jpeg")
+
+        # Screenshot por último (variável, PNG)
+        images.append(
+            (screenshot_bytes, "screenshot_under_analysis")
+        )
+        media_types.append("image/png")
+
+        # Determinar índice do último bloco estático
+        # (última imagem de referência, antes do screenshot)
+        cache_control_index: int | None = None
+        if reference_images:
+            cache_control_index = len(reference_images) - 1
+
+        # Construir texto de regras
+        prompt_text = self._build_rules_text()
+
+        return PromptPayload(
+            images=images,
+            prompt_text=prompt_text,
+            cache_control_index=cache_control_index,
+            media_types=media_types,
+        )
 
     def _load_screenshot(self, screenshot_path: Path) -> bytes:
         """Carrega os bytes do screenshot para análise.
@@ -276,7 +355,42 @@ class CompliancePromptBuilder:
     def _response_format_section(self) -> str:
         """Seção de formato de resposta JSON (igual para ambos brands)."""
         return (
-            "\n\n## FORMATO DE RESPOSTA\n\n"
+            "\n\n## REGRA CRÍTICA: PRECISÃO E CONSERVADORISMO\n\n"
+            "### 1. NÃO ALUCINAR\n"
+            "ANTES de avaliar qualquer regra, verifique se o screenshot "
+            "contém ALGUMA menção visível e clara a:\n"
+            "- Amazon Prime, Prime Video, Amazon Music, Prime Gaming, Prime Reading\n"
+            "- SKY+ (ou DGO)\n"
+            "- Logos da parceria SKY+/Amazon (ou DGO/Amazon)\n\n"
+            "Se NÃO encontrar NENHUMA dessas menções no screenshot, "
+            "TODAS as 6 regras devem ser NOT_APPLICABLE com a descrição: "
+            "'Nenhum conteúdo relacionado à parceria SKY+/Amazon Prime "
+            "foi encontrado no screenshot.'\n\n"
+            "### 2. SER CONSERVADOR NOS FAILS\n"
+            "### 2. CONSERVADOR PARA DETECTAR, ASSERTIVO PARA JULGAR\n"
+            "- CONSERVADOR PARA DETECTAR: Não invente conteúdo. Só avalie "
+            "regras se você REALMENTE vê o elemento no screenshot.\n"
+            "- ASSERTIVO PARA JULGAR: Quando ENCONTRAR evidência real de "
+            "violação, marque FAIL SEM HESITAR. Não seja 'bonzinho'.\n\n"
+            "EXEMPLOS DE QUANDO DEVE SER FAIL OBRIGATÓRIO:\n"
+            "- Preço de combo SKY+/Amazon abaixo de R$80,00 → FAIL naming_pricing\n"
+            "- Prime Video ou Amazon Prime vendido SEPARADO do SKY+ → FAIL facilitator_role\n"
+            "- Amazon Prime na mesma página que Disney+, Telecine, GloboPlay → FAIL kv_integrity\n"
+            "- Uso de 'Prime Video' ou 'SKY' isolado em vez de 'SKY+ com Amazon Prime incluso' → FAIL naming_pricing\n"
+            "- Arte da parceria em página pública de ISP → FAIL content_separation\n\n"
+            "Regras de rigor:\n"
+            "- Deve apontar EXATAMENTE o que viu no screenshot (texto literal, "
+            "posição na página, elemento visual específico).\n"
+            "- NÃO confundir nome do PLANO DE INTERNET do ISP (ex: 'Combo Prime', "
+            "'Smart 500MB') com o nome do SERVIÇO Amazon. O nome do plano do ISP "
+            "pode ser qualquer coisa. A regra naming_pricing se aplica quando o "
+            "site menciona Amazon Prime ou SKY+ — nesses casos DEVE usar a "
+            "nomenclatura 'SKY+ com Amazon Prime incluso'.\n"
+            "- NÃO marcar logo_effects como FAIL apenas por logos estarem "
+            "em tamanho pequeno ou sobre fundo colorido. FAIL é apenas para "
+            "efeitos CLARAMENTE indevidos: filtros de cor, sombras grossas, "
+            "distorção, ou brilho aplicado SOBRE o logo.\n\n"
+            "### 3. FORMATO DE RESPOSTA\n\n"
             "Responda EXCLUSIVAMENTE em JSON válido, sem "
             "markdown, com a seguinte estrutura:\n\n"
             "```json\n"
@@ -287,8 +401,9 @@ class CompliancePromptBuilder:
             '      "status": "PASS" | "FAIL" | '
             '"NOT_APPLICABLE",\n'
             '      "confidence": <integer 0-100>,\n'
-            '      "description": "<descrição dos achados '
-            'em até 1024 caracteres>"\n'
+            '      "description": "<descrição PRECISA dos achados, '
+            "citando texto literal ou elementos visuais ESPECÍFICOS "
+            'vistos no screenshot, em até 1024 caracteres>"\n'
             "    }\n"
             "  ]\n"
             "}\n"
@@ -302,7 +417,13 @@ class CompliancePromptBuilder:
             "5. naming_pricing\n"
             "6. kv_integrity\n\n"
             "Use NOT_APPLICABLE quando a regra não se "
-            "aplica ao conteúdo visível no screenshot."
+            "aplica ao conteúdo visível no screenshot.\n\n"
+            "Na descrição, SEMPRE indique:\n"
+            "- Se PASS: O QUE foi encontrado e por que está correto.\n"
+            "- Se NOT_APPLICABLE: Confirme que nenhum material da parceria "
+            "foi detectado no screenshot.\n"
+            "- Se FAIL: Cite o TEXTO LITERAL ou ELEMENTO VISUAL EXATO "
+            "que constitui a violação, com localização na página."
         )
 
     def _section_facilitator_role(self) -> str:

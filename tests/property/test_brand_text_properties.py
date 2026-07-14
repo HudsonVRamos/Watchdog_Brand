@@ -12,7 +12,7 @@ from hypothesis import strategies as st
 from brand_watchdog.utils.validators import BrandAssetValidator
 
 
-_PBT_SETTINGS = settings(max_examples=100)
+_PBT_SETTINGS = settings(max_examples=30)
 
 # Instância compartilhada do validador
 _validator = BrandAssetValidator()

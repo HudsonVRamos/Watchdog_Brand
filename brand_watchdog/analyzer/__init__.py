@@ -19,6 +19,9 @@ from brand_watchdog.analyzer.compliance_prompt_builder import (
 from brand_watchdog.analyzer.compliance_report_parser import (
     ComplianceReportParser,
 )
+from brand_watchdog.analyzer.reference_image_cache import (
+    ReferenceImageCache,
+)
 
 __all__ = [
     "Analyzer",
@@ -32,4 +35,5 @@ __all__ = [
     "CompliancePromptBuilder",
     "ComplianceReportParser",
     "PromptPayload",
+    "ReferenceImageCache",
 ]

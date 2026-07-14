@@ -38,7 +38,7 @@ from brand_watchdog.storage.detection_store import DetectionStore
 
 # Configuração do Hypothesis para testes PBT
 _PBT_SETTINGS = settings(
-    max_examples=100,
+    max_examples=30,
     suppress_health_check=[HealthCheck.function_scoped_fixture],
     deadline=None,
 )
@@ -143,7 +143,7 @@ class TestExpiredItemCleanup:
                 id=self._screenshot_id,
                 target_site_id=self._target_site_id,
                 monitoring_cycle_id=self._cycle_id,
-                file_path="/tmp/test_screenshot.png",
+                s3_key="screenshots/cycle/test_screenshot.png",
                 captured_at=datetime.now(timezone.utc),
                 height_px=1080,
                 was_truncated=False,

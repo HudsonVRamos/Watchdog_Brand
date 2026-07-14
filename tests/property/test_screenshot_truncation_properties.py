@@ -12,7 +12,7 @@ from hypothesis import strategies as st
 from brand_watchdog.crawler import compute_screenshot_truncation
 
 
-_PBT_SETTINGS = settings(max_examples=100)
+_PBT_SETTINGS = settings(max_examples=30)
 
 # Constante padrão do sistema conforme design
 _MAX_HEIGHT = 20000

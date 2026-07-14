@@ -22,6 +22,7 @@ from sqlalchemy import (
     Index,
     Integer,
     String,
+    UniqueConstraint,
 )
 from sqlalchemy.orm import DeclarativeBase, relationship
 
@@ -71,6 +72,11 @@ class TargetSiteModel(Base):
         back_populates="target_site",
         cascade="all, delete-orphan",
     )
+    site_cycle_results = relationship(
+        "SiteCycleResultModel",
+        back_populates="target_site",
+        cascade="all, delete-orphan",
+    )
 
     def __repr__(self) -> str:
         return (
@@ -108,17 +114,38 @@ class MonitoringCycleModel(Base):
     """Modelo para ciclos de monitoramento.
 
     Registra cada execução do ciclo com estatísticas de processamento.
+    Status válidos: "running", "dispatched", "completed",
+                    "completed_with_timeout", "skipped", "error"
     """
 
     __tablename__ = "monitoring_cycles"
+
+    # Status válidos para o ciclo
+    STATUS_RUNNING = "running"
+    STATUS_DISPATCHED = "dispatched"
+    STATUS_COMPLETED = "completed"
+    STATUS_COMPLETED_WITH_TIMEOUT = "completed_with_timeout"
+    STATUS_SKIPPED = "skipped"
+    STATUS_ERROR = "error"
+
+    VALID_STATUSES = (
+        STATUS_RUNNING,
+        STATUS_DISPATCHED,
+        STATUS_COMPLETED,
+        STATUS_COMPLETED_WITH_TIMEOUT,
+        STATUS_SKIPPED,
+        STATUS_ERROR,
+    )
 
     id: str = Column(String, primary_key=True, default=_generate_uuid)
     started_at: datetime = Column(DateTime(timezone=True), nullable=False)
     ended_at: datetime | None = Column(DateTime(timezone=True), nullable=True)
     sites_processed: int = Column(Integer, default=0)
     sites_failed: int = Column(Integer, default=0)
+    sites_dispatched: int = Column(Integer, default=0)
     detections_found: int = Column(Integer, default=0)
     status: str = Column(String(20), default="running")
+    rule_set_version: str | None = Column(String(30), nullable=True)
 
     # Relationships
     screenshots = relationship(
@@ -128,6 +155,11 @@ class MonitoringCycleModel(Base):
     )
     detection_results = relationship(
         "DetectionResultModel",
+        back_populates="monitoring_cycle",
+        cascade="all, delete-orphan",
+    )
+    site_cycle_results = relationship(
+        "SiteCycleResultModel",
         back_populates="monitoring_cycle",
         cascade="all, delete-orphan",
     )
@@ -143,6 +175,8 @@ class ScreenshotModel(Base):
     """Modelo para screenshots capturados.
 
     Armazena metadados de cada screenshot com referência ao site e ciclo.
+    O campo s3_key armazena a chave do objeto no S3
+    (formato: screenshots/{cycle_id}/{screenshot_id}.png).
     O campo expires_at é indexado para queries de cleanup eficientes.
     """
 
@@ -158,7 +192,7 @@ class ScreenshotModel(Base):
     monitoring_cycle_id: str = Column(
         String, ForeignKey("monitoring_cycles.id"), nullable=False
     )
-    file_path: str = Column(String(512), nullable=False)
+    s3_key: str = Column(String(512), nullable=False)
     captured_at: datetime = Column(DateTime(timezone=True), nullable=False)
     height_px: int = Column(Integer, nullable=False)
     was_truncated: bool = Column(Boolean, default=False)
@@ -264,4 +298,84 @@ class AlertLogModel(Base):
         return (
             f"<AlertLogModel(id={self.id!r}, recipient={self.recipient!r}, "
             f"success={self.success})>"
+        )
+
+
+class SiteCycleResultModel(Base):
+    """Modelo para resultados de processamento por site dentro de um ciclo.
+
+    Registra o resultado (sucesso ou falha) do processamento de cada site
+    individual por um Worker ECS. Usado para consolidação do ciclo.
+    """
+
+    __tablename__ = "site_cycle_results"
+    __table_args__ = (
+        UniqueConstraint("site_id", "cycle_id", name="uq_site_cycle"),
+        Index("ix_site_cycle_results_cycle_id", "cycle_id"),
+    )
+
+    # Status válidos para resultado do site
+    STATUS_SUCCESS = "success"
+    STATUS_FAILURE = "failure"
+
+    id: str = Column(String, primary_key=True, default=_generate_uuid)
+    site_id: str = Column(
+        String, ForeignKey("target_sites.id"), nullable=False
+    )
+    cycle_id: str = Column(
+        String, ForeignKey("monitoring_cycles.id"), nullable=False
+    )
+    status: str = Column(String(20), nullable=False)
+    detections_count: int = Column(Integer, default=0)
+    failure_reason: str | None = Column(String(1024), nullable=True)
+    completed_at: datetime = Column(
+        DateTime(timezone=True), nullable=False
+    )
+
+    # Relationships
+    target_site = relationship(
+        "TargetSiteModel", back_populates="site_cycle_results"
+    )
+    monitoring_cycle = relationship(
+        "MonitoringCycleModel", back_populates="site_cycle_results"
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<SiteCycleResultModel(id={self.id!r}, "
+            f"site_id={self.site_id!r}, status={self.status!r})>"
+        )
+
+
+class NotificationDedupModel(Base):
+    """Modelo para deduplicação de notificações por email.
+
+    Garante que cada combinação (cycle_id, target_url) só é processada
+    uma vez, evitando reenvio de emails duplicados.
+    """
+
+    __tablename__ = "notification_dedup"
+    __table_args__ = (
+        UniqueConstraint(
+            "cycle_id", "target_url", name="uq_cycle_url"
+        ),
+        Index(
+            "ix_notification_dedup_cycle_url",
+            "cycle_id",
+            "target_url",
+        ),
+    )
+
+    id: str = Column(String, primary_key=True, default=_generate_uuid)
+    cycle_id: str = Column(String, nullable=False)
+    target_url: str = Column(String(2048), nullable=False)
+    processed_at: datetime = Column(
+        DateTime(timezone=True), nullable=False
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<NotificationDedupModel(id={self.id!r}, "
+            f"cycle_id={self.cycle_id!r}, "
+            f"target_url={self.target_url!r})>"
         )

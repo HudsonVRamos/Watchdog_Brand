@@ -1,0 +1,76 @@
+{
+  "$comment": "ECS Fargate Task Definition para o Worker do Brand Watchdog. Este arquivo serve como referência - a definição real está no CloudFormation (infra/worker-infrastructure.yml).",
+  "family": "brand-watchdog-worker",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "1024",
+  "memory": "2048",
+  "executionRoleArn": "arn:aws:iam::{ACCOUNT_ID}:role/brand-watchdog-worker-execution-role",
+  "taskRoleArn": "arn:aws:iam::{ACCOUNT_ID}:role/brand-watchdog-worker-task-role",
+  "containerDefinitions": [
+    {
+      "name": "brand-watchdog-worker",
+      "image": "{ACCOUNT_ID}.dkr.ecr.us-east-1.amazonaws.com/brand-watchdog-worker:latest",
+      "essential": true,
+      "cpu": 1024,
+      "memory": 2048,
+      "environment": [
+        {
+          "name": "QUEUE_URL",
+          "value": "https://sqs.us-east-1.amazonaws.com/{ACCOUNT_ID}/brand-watchdog-tasks"
+        },
+        {
+          "name": "DLQ_URL",
+          "value": "https://sqs.us-east-1.amazonaws.com/{ACCOUNT_ID}/brand-watchdog-dlq"
+        },
+        {
+          "name": "S3_BUCKET",
+          "value": "brand-watchdog-screenshots-{ACCOUNT_ID}"
+        },
+        {
+          "name": "DATABASE_URL",
+          "value": "postgresql+asyncpg://watchdog:{PASSWORD}@{RDS_ENDPOINT}:5432/brand_watchdog"
+        },
+        {
+          "name": "ALERT_SES_SENDER",
+          "value": "{SES_VERIFIED_EMAIL}"
+        },
+        {
+          "name": "ALERT_RECIPIENTS",
+          "value": "{RECIPIENT_EMAILS}"
+        },
+        {
+          "name": "AWS_DEFAULT_REGION",
+          "value": "us-east-1"
+        },
+        {
+          "name": "WORKER_PROCESSING_TIMEOUT",
+          "value": "120"
+        },
+        {
+          "name": "WORKER_VISIBILITY_RENEW_INTERVAL",
+          "value": "60"
+        },
+        {
+          "name": "WORKER_VISIBILITY_TIMEOUT",
+          "value": "120"
+        }
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/brand-watchdog-worker",
+          "awslogs-region": "us-east-1",
+          "awslogs-stream-prefix": "worker"
+        }
+      },
+      "healthCheck": {
+        "command": ["CMD-SHELL", "python -c \"print('healthy')\" || exit 1"],
+        "interval": 60,
+        "timeout": 10,
+        "retries": 3,
+        "startPeriod": 60
+      }
+    }
+  ]
+}

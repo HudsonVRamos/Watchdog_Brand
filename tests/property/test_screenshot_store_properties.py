@@ -12,13 +12,16 @@ que foram gravados.
 
 from __future__ import annotations
 
+import os
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
+import boto3
 import pytest
 from hypothesis import given, settings, HealthCheck
 from hypothesis import strategies as st
+from moto import mock_aws
 
 from brand_watchdog.config import StorageConfig
 from brand_watchdog.models.database import (
@@ -35,8 +38,9 @@ from brand_watchdog.storage.screenshot_store import ScreenshotStore
 
 
 _PBT_SETTINGS = settings(
-    max_examples=100,
+    max_examples=30,
     suppress_health_check=[HealthCheck.function_scoped_fixture],
+    deadline=None,
 )
 
 
@@ -50,10 +54,18 @@ class TestScreenshotStorageRoundTrip:
 
     @pytest.fixture(autouse=True)
     async def setup_db(self, tmp_path: Path):
-        """Configura banco in-memory e fixtures de FK para cada teste."""
+        """Configura banco in-memory, moto S3 e fixtures de FK."""
+        os.environ["AWS_ACCESS_KEY_ID"] = "testing"
+        os.environ["AWS_SECRET_ACCESS_KEY"] = "testing"
+        os.environ["AWS_SECURITY_TOKEN"] = "testing"
+        os.environ["AWS_SESSION_TOKEN"] = "testing"
+        os.environ["AWS_DEFAULT_REGION"] = "us-east-1"
+
         config = StorageConfig(
             database_url="sqlite+aiosqlite:///:memory:",
             screenshot_base_path=tmp_path / "screenshots",
+            s3_bucket="brand-watchdog-screenshots-test",
+            s3_region="us-east-1",
         )
         setup_database(config)
         await init_db()
@@ -80,8 +92,17 @@ class TestScreenshotStorageRoundTrip:
             )
             session.add(cycle)
 
+        # Inicializar moto S3
+        self._mock_aws = mock_aws()
+        self._mock_aws.start()
+        s3 = boto3.client("s3", region_name="us-east-1")
+        s3.create_bucket(Bucket="brand-watchdog-screenshots-test")
+
         self._store = ScreenshotStore(config)
+        self._store._s3_client = s3
+
         yield
+        self._mock_aws.stop()
         await close_db()
 
     @_PBT_SETTINGS

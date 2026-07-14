@@ -232,6 +232,7 @@ Resources:
         Rules:
           - Id: ExpireScreenshots
             Status: Enabled
+            Prefix: "screenshots/"
             ExpirationInDays: 90
       PublicAccessBlockConfiguration:
         BlockPublicAcls: true
@@ -393,6 +394,18 @@ Resources:
                   - logs:CreateLogStream
                   - logs:PutLogEvents
                 Resource: "*"
+              # SQS - publicar mensagens na fila do Worker
+              - Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                  - sqs:SendMessageBatch
+                  - sqs:GetQueueAttributes
+                Resource: !Sub "arn:aws:sqs:${AWS::Region}:${AWS::AccountId}:${ProjectName}-tasks"
+              # EventBridge - publicar eventos
+              - Effect: Allow
+                Action:
+                  - events:PutEvents
+                Resource: !Sub "arn:aws:events:${AWS::Region}:${AWS::AccountId}:event-bus/default"
 
   # ============================================================
   # ECS Cluster + Service

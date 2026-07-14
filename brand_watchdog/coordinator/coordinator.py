@@ -1,11 +1,15 @@
 """Coordenador de ciclos de monitoramento de compliance.
 
-Orquestra o fluxo completo: capture → analyze_compliance → notify
-para cada Target Site ativo, com lock de ciclo para evitar
-execuções sobrepostas, persistência de resultados e logging
-de estatísticas.
+Orquestra o novo fluxo distribuído:
+1. Calcula versão do conjunto de regras (RuleSetVersionCalculator)
+2. Cria ciclo no banco com status "dispatched"
+3. Publica mensagens na fila SQS (SQSPublisher)
+4. Inicia consolidação assíncrona (CycleConsolidator)
 
-Requirements: 1.1, 8.1, 9.1
+O processamento individual de sites é agora responsabilidade
+dos Workers ECS que consomem da fila SQS.
+
+Requirements: 1.1, 1.5, 7.1, 7.2, 7.4
 """
 
 from __future__ import annotations
@@ -15,85 +19,79 @@ import logging
 import uuid
 from datetime import datetime, timezone
 
-from brand_watchdog.alerts.compliance_email_notifier import (
-    ComplianceEmailNotifier,
-)
-from brand_watchdog.analyzer.compliance_analyzer import ComplianceAnalyzer
 from brand_watchdog.config import AppConfig
-from brand_watchdog.crawler.crawler import Crawler
+from brand_watchdog.coordinator.cycle_consolidator import (
+    CycleConsolidator,
+)
 from brand_watchdog.models.database import get_session
 from brand_watchdog.models.dataclasses import (
-    ComplianceReport,
     CycleResult,
-    SiteResult,
     TargetSite,
 )
 from brand_watchdog.models.entities import MonitoringCycleModel
-from brand_watchdog.registry.target_site_manager import TargetSiteManager
-from brand_watchdog.storage.detection_store import DetectionStore
-from brand_watchdog.storage.screenshot_store import ScreenshotStore
+from brand_watchdog.queue.messages import ProcessingMessage
+from brand_watchdog.queue.publisher import SQSPublisher
+from brand_watchdog.registry.target_site_manager import (
+    TargetSiteManager,
+)
+from brand_watchdog.utils.rule_set_version import (
+    RuleSetDirectoryError,
+    RuleSetVersionCalculator,
+)
 
 logger = logging.getLogger(__name__)
 
 
 class MonitoringCoordinator:
-    """Coordena ciclos completos de monitoramento de compliance.
+    """Coordena ciclos de monitoramento de compliance (distribuído).
 
     Responsabilidades:
-        - Executar ciclos de monitoramento
-          (capture → analyze_compliance → notify)
+        - Calcular versão do conjunto de regras no início do ciclo
+        - Publicar mensagens na fila SQS para Workers ECS
+        - Iniciar consolidação assíncrona dos resultados
         - Garantir que apenas um ciclo executa por vez (lock)
-        - Processar todos os Target Sites ativos com isolamento
-          de falha
         - Persistir ciclo e estatísticas no banco de dados
         - Logar início, fim e resultados do ciclo
 
     Args:
-        crawler: Instância do Crawler para captura de screenshots.
-        compliance_analyzer: Instância do ComplianceAnalyzer para
-            validação de compliance.
-        compliance_notifier: Instância do ComplianceEmailNotifier
-            para envio de relatórios.
-        detection_store: Store para persistência de detecções.
-        screenshot_store: Store para persistência de screenshots.
+        rule_set_calculator: Calculador de versão de regras.
+        sqs_publisher: Publisher de mensagens na fila SQS.
+        consolidator: Consolidador de resultados do ciclo.
         target_site_manager: Gerenciador de sites-alvo.
         config: Configuração da aplicação.
     """
 
     def __init__(
         self,
-        crawler: Crawler,
-        compliance_analyzer: ComplianceAnalyzer,
-        compliance_notifier: ComplianceEmailNotifier,
-        detection_store: DetectionStore,
-        screenshot_store: ScreenshotStore,
+        rule_set_calculator: RuleSetVersionCalculator,
+        sqs_publisher: SQSPublisher,
+        consolidator: CycleConsolidator,
         target_site_manager: TargetSiteManager,
         config: AppConfig,
     ) -> None:
-        self._crawler = crawler
-        self._compliance_analyzer = compliance_analyzer
-        self._compliance_notifier = compliance_notifier
-        self._detection_store = detection_store
-        self._screenshot_store = screenshot_store
+        self._rule_set_calculator = rule_set_calculator
+        self._sqs_publisher = sqs_publisher
+        self._consolidator = consolidator
         self._target_site_manager = target_site_manager
         self._config = config
         self._cycle_running = False
         self._lock = asyncio.Lock()
+        self._previous_rule_version: str | None = None
 
     async def run_cycle(self) -> CycleResult:
-        """Executa um ciclo completo de monitoramento.
+        """Executa um ciclo completo de monitoramento (distribuído).
 
-        Fluxo:
+        Novo fluxo:
             1. Verifica lock de ciclo (se já em execução, pula)
-            2. Cria MonitoringCycleModel no banco com status="running"
-            3. Obtém todos os Target Sites ativos
-            4. Processa cada site
-               (capture → analyze_compliance → notify)
-            5. Atualiza ciclo com stats e status="completed"
-            6. Loga resumo completo do ciclo
+            2. Calcula versão do conjunto de regras
+            3. Cria ciclo no banco com rule_set_version
+            4. Obtém Target Sites ativos
+            5. Publica mensagens na fila SQS
+            6. Atualiza ciclo com status "dispatched"
+            7. Inicia consolidação assíncrona (background)
 
         Returns:
-            CycleResult com estatísticas do ciclo executado.
+            CycleResult com estatísticas do ciclo iniciado.
             Se o ciclo foi pulado (lock), retorna CycleResult
             com sites_processed=0 e status refletindo o skip.
         """
@@ -137,12 +135,20 @@ class MonitoringCoordinator:
                 self._cycle_running = False
 
     async def _execute_cycle(self) -> CycleResult:
-        """Executa o ciclo de monitoramento propriamente dito.
+        """Executa o ciclo de monitoramento distribuído.
 
-        Separado de run_cycle para manter a lógica de lock limpa.
+        Fluxo:
+            1. Calcula rule_set_version
+            2. Verifica mudança de versão e loga
+            3. Cria ciclo no banco
+            4. Obtém sites ativos
+            5. Cria ProcessingMessages
+            6. Publica na fila via SQSPublisher
+            7. Atualiza ciclo com status "dispatched"
+            8. Inicia consolidação em background
 
         Returns:
-            CycleResult com estatísticas completas.
+            CycleResult com estatísticas do despacho.
         """
         cycle_id = str(uuid.uuid4())
         started_at = datetime.now(timezone.utc)
@@ -153,12 +159,50 @@ class MonitoringCoordinator:
             started_at.isoformat(),
         )
 
+        # 1. Calcular versão do conjunto de regras
+        try:
+            rule_version = self._rule_set_calculator.calculate()
+        except RuleSetDirectoryError as exc:
+            logger.error(
+                "Erro ao calcular versão de regras: %s. "
+                "Ciclo abortado.",
+                str(exc),
+            )
+            await self._create_cycle_record(
+                cycle_id=cycle_id,
+                started_at=started_at,
+                status=MonitoringCycleModel.STATUS_ERROR,
+            )
+            return CycleResult(
+                cycle_id=cycle_id,
+                started_at=started_at,
+                ended_at=datetime.now(timezone.utc),
+                sites_processed=0,
+                sites_failed=0,
+                detections_found=0,
+                site_results=[],
+            )
+
+        # 2. Verificar mudança de versão e logar
+        if self._rule_set_calculator.has_changed(
+            self._previous_rule_version
+        ):
+            logger.info(
+                "Mudança de versão de regras: %s -> %s",
+                self._previous_rule_version,
+                rule_version,
+            )
+        self._previous_rule_version = rule_version
+
+        # 3. Criar ciclo no banco com rule_set_version
         await self._create_cycle_record(
             cycle_id=cycle_id,
             started_at=started_at,
-            status="running",
+            status=MonitoringCycleModel.STATUS_DISPATCHED,
+            rule_set_version=rule_version,
         )
 
+        # 4. Obter sites ativos
         target_sites = await self._target_site_manager.list_all()
 
         if not target_sites:
@@ -166,189 +210,100 @@ class MonitoringCoordinator:
                 "Nenhum Target Site ativo encontrado. "
                 "Ciclo encerrado sem processamento."
             )
-
-        site_results: list[SiteResult] = []
-        cycle_reports: list[ComplianceReport] = []
-        sites_processed = 0
-        sites_failed = 0
-        total_detections = 0
-
-        for target_site in target_sites:
-            site_result, report = await self._process_site(
-                target_site=target_site,
+            ended_at = datetime.now(timezone.utc)
+            await self._update_cycle_record(
                 cycle_id=cycle_id,
+                ended_at=ended_at,
+                sites_processed=0,
+                sites_failed=0,
+                detections_found=0,
+                status=MonitoringCycleModel.STATUS_COMPLETED,
             )
-            site_results.append(site_result)
-
-            if site_result.success:
-                sites_processed += 1
-                if report is not None:
-                    cycle_reports.append(report)
-            else:
-                sites_failed += 1
-
-            total_detections += len(site_result.detections)
-
-        # Enviar email consolidado do ciclo (1 único email)
-        recipients = self._config.alert.recipients
-        if recipients and cycle_reports:
-            await self._compliance_notifier.send_cycle_report(
-                reports=cycle_reports,
-                recipients=recipients,
+            return CycleResult(
+                cycle_id=cycle_id,
+                started_at=started_at,
+                ended_at=ended_at,
+                sites_processed=0,
+                sites_failed=0,
+                detections_found=0,
+                site_results=[],
             )
 
-        ended_at = datetime.now(timezone.utc)
-        await self._update_cycle_record(
+        # 5. Criar ProcessingMessages para cada site
+        messages = self._build_messages(
+            target_sites=target_sites,
             cycle_id=cycle_id,
-            ended_at=ended_at,
-            sites_processed=sites_processed,
-            sites_failed=sites_failed,
-            detections_found=total_detections,
-            status="completed",
+            rule_version=rule_version,
+        )
+
+        # 6. Publicar mensagens via SQSPublisher
+        success_count, failure_count = (
+            await self._sqs_publisher.publish_all(messages)
+        )
+
+        sites_dispatched = len(target_sites)
+
+        # 7. Atualizar ciclo com status "dispatched"
+        await self._update_cycle_dispatched(
+            cycle_id=cycle_id,
+            sites_dispatched=sites_dispatched,
+            sites_failed=failure_count,
         )
 
         logger.info(
-            "Ciclo de monitoramento concluído: id=%s, "
-            "start=%s, end=%s, sites_processed=%d, "
-            "sites_failed=%d, detections_found=%d",
+            "Ciclo despachado: id=%s, sites_dispatched=%d, "
+            "publicados=%d, falhas=%d, rule_version=%s",
             cycle_id,
-            started_at.isoformat(),
-            ended_at.isoformat(),
-            sites_processed,
-            sites_failed,
-            total_detections,
+            sites_dispatched,
+            success_count,
+            failure_count,
+            rule_version,
+        )
+
+        # 8. Iniciar consolidação em background (non-blocking)
+        asyncio.create_task(
+            self._consolidator.consolidate(
+                cycle_id=cycle_id,
+                sites_dispatched=sites_dispatched,
+            )
         )
 
         return CycleResult(
             cycle_id=cycle_id,
             started_at=started_at,
-            ended_at=ended_at,
-            sites_processed=sites_processed,
-            sites_failed=sites_failed,
-            detections_found=total_detections,
-            site_results=site_results,
+            ended_at=datetime.now(timezone.utc),
+            sites_processed=success_count,
+            sites_failed=failure_count,
+            detections_found=0,
+            site_results=[],
         )
 
-    async def _process_site(
+    def _build_messages(
         self,
-        target_site: TargetSite,
+        target_sites: list[TargetSite],
         cycle_id: str,
-    ) -> tuple[SiteResult, ComplianceReport | None]:
-        """Processa um site: capture → analyze_compliance.
-
-        Fluxo:
-            1. Captura screenshot via Crawler
-            2. Armazena screenshot via ScreenshotStore
-            3. Chama compliance_analyzer.analyze_compliance()
-               → ComplianceReport
-            4. Retorna (SiteResult, ComplianceReport)
-
-        O envio de email é feito de forma consolidada no final
-        do ciclo (1 email com todos os sites).
-
-        Se qualquer etapa falhar com exceção, registra o erro e
-        retorna (SiteResult(success=False), None), permitindo que
-        o ciclo continue com os demais sites.
+        rule_version: str,
+    ) -> list[ProcessingMessage]:
+        """Cria lista de ProcessingMessage para cada site ativo.
 
         Args:
-            target_site: Site-alvo a ser processado.
-            cycle_id: ID do ciclo de monitoramento atual.
+            target_sites: Lista de sites-alvo ativos.
+            cycle_id: ID do ciclo de monitoramento.
+            rule_version: Versão do conjunto de regras.
 
         Returns:
-            Tupla (SiteResult, ComplianceReport | None).
+            Lista de ProcessingMessage para publicação na fila.
         """
-        logger.info(
-            "Processando site: url=%s, id=%s",
-            target_site.url,
-            target_site.id,
-        )
-
-        try:
-            # Etapa 1: Captura de screenshot
-            capture_result = await self._crawler.capture(
-                target_site.url
-            )
-
-            if not capture_result.success:
-                logger.warning(
-                    "Falha na captura de %s: %s",
-                    target_site.url,
-                    capture_result.error_message,
-                )
-                return (
-                    SiteResult(
-                        target_url=target_site.url,
-                        success=False,
-                        detections=[],
-                        error_message=capture_result.error_message,
-                    ),
-                    None,
-                )
-
-            # Etapa 2: Armazena screenshot
-            screenshot_model = await self._screenshot_store.store(
-                png_bytes=(
-                    capture_result.screenshot_path.read_bytes()
-                ),
-                target_site_id=target_site.id,
+        return [
+            ProcessingMessage(
+                site_id=site.id,
                 cycle_id=cycle_id,
-                height_px=capture_result.page_height_px,
-                was_truncated=capture_result.was_truncated,
+                brand=site.brand,
+                url=site.url,
+                rule_set_version=rule_version,
             )
-            screenshot_id = screenshot_model.id
-
-            # Etapa 3: Análise de compliance
-            report = (
-                await self._compliance_analyzer.analyze_compliance(
-                    screenshot_path=(
-                        capture_result.screenshot_path
-                    ),
-                    target_url=target_site.url,
-                    screenshot_ref_id=screenshot_id,
-                    cycle_id=cycle_id,
-                    brand=target_site.brand,
-                    target_site_id=target_site.id,
-                )
-            )
-
-            logger.info(
-                "Site processado com sucesso: url=%s, "
-                "status=%s, regras_fail=%d",
-                target_site.url,
-                report.overall_status,
-                sum(
-                    1
-                    for r in report.rule_results
-                    if r.status == "FAIL"
-                ),
-            )
-
-            return (
-                SiteResult(
-                    target_url=target_site.url,
-                    success=True,
-                    detections=[],
-                ),
-                report,
-            )
-
-        except Exception as exc:
-            # Falha isolada — não interrompe ciclo
-            logger.error(
-                "Erro ao processar site %s: %s",
-                target_site.url,
-                str(exc),
-                exc_info=True,
-            )
-            return (
-                SiteResult(
-                    target_url=target_site.url,
-                    success=False,
-                    detections=[],
-                    error_message=str(exc),
-                ),
-                None,
-            )
+            for site in target_sites
+        ]
 
     def _is_cycle_running(self) -> bool:
         """Verifica se um ciclo está em execução (lock).
@@ -366,27 +321,32 @@ class MonitoringCoordinator:
         cycle_id: str,
         started_at: datetime,
         status: str = "running",
+        rule_set_version: str | None = None,
     ) -> None:
         """Cria registro de MonitoringCycleModel no banco.
 
         Args:
             cycle_id: ID único do ciclo.
             started_at: Timestamp de início do ciclo.
-            status: Status inicial ("running" ou "skipped").
+            status: Status inicial do ciclo.
+            rule_set_version: Versão do conjunto de regras.
         """
         async with get_session() as session:
             cycle_model = MonitoringCycleModel(
                 id=cycle_id,
                 started_at=started_at,
                 status=status,
+                rule_set_version=rule_set_version,
             )
             session.add(cycle_model)
             await session.flush()
 
         logger.debug(
-            "Registro de ciclo criado: id=%s, status=%s",
+            "Registro de ciclo criado: id=%s, status=%s, "
+            "rule_set_version=%s",
             cycle_id,
             status,
+            rule_set_version,
         )
 
     async def _update_cycle_record(
@@ -406,7 +366,7 @@ class MonitoringCoordinator:
             sites_processed: Número de sites com sucesso.
             sites_failed: Número de sites que falharam.
             detections_found: Total de detecções encontradas.
-            status: Status final ("completed" ou "skipped").
+            status: Status final do ciclo.
         """
         from sqlalchemy import select
 
@@ -432,4 +392,44 @@ class MonitoringCoordinator:
             sites_processed,
             sites_failed,
             detections_found,
+        )
+
+    async def _update_cycle_dispatched(
+        self,
+        cycle_id: str,
+        sites_dispatched: int,
+        sites_failed: int = 0,
+    ) -> None:
+        """Atualiza ciclo com informações de despacho.
+
+        Registra o número de sites despachados e falhas de
+        publicação, mantendo status "dispatched".
+
+        Args:
+            cycle_id: ID do ciclo a atualizar.
+            sites_dispatched: Total de sites despachados.
+            sites_failed: Falhas na publicação SQS.
+        """
+        from sqlalchemy import select
+
+        async with get_session() as session:
+            stmt = select(MonitoringCycleModel).where(
+                MonitoringCycleModel.id == cycle_id
+            )
+            result = await session.execute(stmt)
+            cycle_model = result.scalar_one_or_none()
+
+            if cycle_model is not None:
+                cycle_model.sites_dispatched = sites_dispatched
+                cycle_model.sites_failed = sites_failed
+                cycle_model.status = (
+                    MonitoringCycleModel.STATUS_DISPATCHED
+                )
+
+        logger.debug(
+            "Ciclo atualizado para dispatched: id=%s, "
+            "sites_dispatched=%d, sites_failed=%d",
+            cycle_id,
+            sites_dispatched,
+            sites_failed,
         )

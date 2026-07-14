@@ -385,6 +385,12 @@ def compliance_report(draw: st.DrawFn) -> ComplianceReport:
             max_size=30,
         )
     )
+    rule_set_version = draw(
+        st.from_regex(
+            r"v[0-9]{10}_[0-9a-f]{8}",
+            fullmatch=True,
+        )
+    )
 
     return ComplianceReport(
         target_url=target_url,
@@ -393,6 +399,7 @@ def compliance_report(draw: st.DrawFn) -> ComplianceReport:
         rule_results=rule_results,
         screenshot_ref_id=screenshot_ref_id,
         cycle_id=cycle_id,
+        rule_set_version=rule_set_version,
     )
 
 

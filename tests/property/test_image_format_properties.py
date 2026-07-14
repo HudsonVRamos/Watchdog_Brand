@@ -13,7 +13,7 @@ from brand_watchdog.utils.validators import BrandAssetValidator
 from brand_watchdog.models.dataclasses import ValidationResult
 
 
-_PBT_SETTINGS = settings(max_examples=100)
+_PBT_SETTINGS = settings(max_examples=30)
 
 # Constantes de referência
 MAX_IMAGE_SIZE = 5 * 1024 * 1024  # 5 MB

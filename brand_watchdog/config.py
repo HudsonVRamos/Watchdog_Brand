@@ -30,9 +30,9 @@ class CrawlerConfig:
 class AnalyzerConfig:
     """Configuração do analisador AWS Bedrock."""
 
-    bedrock_model_id: str = "anthropic.claude-sonnet-4-6"
+    bedrock_model_id: str = "us.anthropic.claude-sonnet-4-6"
     bedrock_region: str = "us-east-1"
-    confidence_threshold: int = 70
+    confidence_threshold: int = 80
     request_timeout_seconds: int = 60
     max_retries: int = 3
     retry_base_delay_seconds: float = 2.0
@@ -69,6 +69,55 @@ class StorageConfig:
     detection_retention_days: int = 90
     screenshot_base_path: Path = field(default_factory=lambda: Path("./data/screenshots"))
     database_url: str = "sqlite+aiosqlite:///./data/brand_watchdog.db"
+    s3_bucket: str = "brand-watchdog-screenshots-761018874615"
+    s3_region: str = "us-east-1"
+    s3_multipart_threshold: int = 5_242_880  # 5MB
+
+
+@dataclass
+class QueueConfig:
+    """Configuração da fila SQS."""
+
+    queue_url: str = ""
+    dlq_url: str = ""
+    visibility_timeout_seconds: int = 300
+    max_receive_count: int = 3
+    batch_size: int = 10
+    publish_timeout_minutes: int = 5
+
+
+@dataclass
+class EventConfig:
+    """Configuração do EventBridge."""
+
+    event_bus_name: str = "default"
+    source: str = "brand-watchdog"
+    detail_type_compliance: str = "ComplianceCompleted"
+    region: str = "us-east-1"
+    max_retries: int = 3
+
+
+@dataclass
+class WorkerConfig:
+    """Configuração do Worker ECS."""
+
+    processing_timeout_seconds: int = 300
+    visibility_renew_interval_seconds: int = 90
+    consolidation_poll_interval_seconds: int = 30
+    consolidation_timeout_minutes: int = 60
+    max_concurrent_tasks: int = 10
+    scale_target_messages_per_task: int = 5
+    scale_in_cooldown_seconds: int = 120
+    scale_out_cooldown_seconds: int = 60
+
+
+@dataclass
+class CacheConfig:
+    """Configuração do cache de referências."""
+
+    max_image_size_px: int = 1568
+    jpeg_quality: int = 85
+    enable_prompt_caching: bool = True
 
 
 # Valid brand types for compliance monitoring
@@ -84,6 +133,10 @@ class AppConfig:
     alert: AlertConfig = field(default_factory=AlertConfig)
     schedule: ScheduleConfig = field(default_factory=ScheduleConfig)
     storage: StorageConfig = field(default_factory=StorageConfig)
+    queue: QueueConfig = field(default_factory=QueueConfig)
+    event: EventConfig = field(default_factory=EventConfig)
+    worker: WorkerConfig = field(default_factory=WorkerConfig)
+    cache: CacheConfig = field(default_factory=CacheConfig)
     max_target_sites: int = 200
     brand: str = "sky_plus"  # "sky_plus" or "dgo"
 
@@ -95,6 +148,10 @@ _SECTION_MAP: dict[str, type] = {
     "alert": AlertConfig,
     "schedule": ScheduleConfig,
     "storage": StorageConfig,
+    "queue": QueueConfig,
+    "event": EventConfig,
+    "worker": WorkerConfig,
+    "cache": CacheConfig,
 }
 
 

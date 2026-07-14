@@ -1,0 +1,8 @@
+{
+  "containerOverrides": [
+    {
+      "name": "brand-watchdog-worker",
+      "command": ["python", "-m", "brand_watchdog.migrate"]
+    }
+  ]
+}

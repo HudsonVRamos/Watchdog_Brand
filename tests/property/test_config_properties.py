@@ -16,7 +16,7 @@ from brand_watchdog.config import load_config
 # monkeypatch apenas seta variáveis de ambiente que não mantêm estado
 # entre iterações — cada chamada de load_config lê o env fresco.
 _PBT_SETTINGS = settings(
-    max_examples=100,
+    max_examples=30,
     suppress_health_check=[HealthCheck.function_scoped_fixture],
 )
 

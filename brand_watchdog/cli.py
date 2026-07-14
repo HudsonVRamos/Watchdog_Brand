@@ -202,60 +202,82 @@ async def list_assets() -> None:
 
 
 async def run_cycle() -> None:
-    """Dispara um ciclo de monitoramento manualmente."""
+    """Dispara um ciclo de monitoramento manualmente.
+
+    Instancia o MonitoringCoordinator com as dependências do
+    fluxo distribuído (RuleSetVersionCalculator, SQSPublisher,
+    CycleConsolidator, TargetSiteManager) e executa um ciclo.
+    """
     config = await _setup()
 
+    from brand_watchdog.coordinator.coordinator import (
+        MonitoringCoordinator,
+    )
+    from brand_watchdog.coordinator.cycle_consolidator import (
+        CycleConsolidator,
+    )
+    from brand_watchdog.queue.publisher import SQSPublisher
+    from brand_watchdog.registry.target_site_manager import (
+        TargetSiteManager,
+    )
+    from brand_watchdog.utils.rule_set_version import (
+        RuleSetVersionCalculator,
+    )
+
+    # Componentes do fluxo distribuído
+    rules_dir = Path("watchdog_rules")
+    rule_set_calculator = RuleSetVersionCalculator(
+        rules_dir=rules_dir,
+    )
+    sqs_publisher = SQSPublisher(
+        queue_url=config.queue.queue_url,
+        region=config.storage.s3_region,
+    )
+
+    # Email Notifier para relatório consolidado
     from brand_watchdog.alerts.compliance_email_notifier import (
         ComplianceEmailNotifier,
     )
     from brand_watchdog.alerts.email_providers import (
         create_email_provider,
     )
-    from brand_watchdog.analyzer.bedrock_client import BedrockClient
-    from brand_watchdog.analyzer.compliance_analyzer import (
-        ComplianceAnalyzer,
-    )
-    from brand_watchdog.coordinator.coordinator import (
-        MonitoringCoordinator,
-    )
-    from brand_watchdog.crawler.crawler import Crawler
-    from brand_watchdog.registry.target_site_manager import (
-        TargetSiteManager,
-    )
-    from brand_watchdog.storage.detection_store import DetectionStore
-    from brand_watchdog.storage.screenshot_store import ScreenshotStore
 
-    crawler = Crawler(config=config.crawler, storage_config=config.storage)
-    bedrock_client = BedrockClient(config=config.analyzer)
-    detection_store = DetectionStore(config=config.storage)
-    compliance_analyzer = ComplianceAnalyzer(
-        config=config.analyzer,
-        bedrock_client=bedrock_client,
-        detection_store=detection_store,
-        storage_config=config.storage,
-    )
-    screenshot_store = ScreenshotStore(config=config.storage)
-    target_site_manager = TargetSiteManager(
-        max_target_sites=config.max_target_sites
-    )
     email_provider = create_email_provider(config.alert)
-    compliance_notifier = ComplianceEmailNotifier(
+    email_notifier = ComplianceEmailNotifier(
         config=config.alert,
         email_provider=email_provider,
     )
+    recipients = config.alert.recipients
+    if isinstance(recipients, str):
+        recipients = [r.strip() for r in recipients.split(",")]
+
+    consolidator = CycleConsolidator(
+        config=config.worker,
+        email_notifier=email_notifier,
+        recipients=recipients,
+    )
+    target_site_manager = TargetSiteManager(
+        max_target_sites=config.max_target_sites,
+    )
 
     coordinator = MonitoringCoordinator(
-        crawler=crawler,
-        compliance_analyzer=compliance_analyzer,
-        compliance_notifier=compliance_notifier,
-        detection_store=detection_store,
-        screenshot_store=screenshot_store,
+        rule_set_calculator=rule_set_calculator,
+        sqs_publisher=sqs_publisher,
+        consolidator=consolidator,
         target_site_manager=target_site_manager,
         config=config,
     )
 
     print("🔄 Iniciando ciclo de monitoramento...")
     result = await coordinator.run_cycle()
+
+    # Aguardar consolidação (Workers processam os sites)
+    print("⏳ Aguardando Workers processarem os sites...")
+    print("   (O email consolidado será enviado ao final)")
+    # Aguarda tasks pendentes (consolidation task em background)
+    pending = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
 
     print(f"\n{'='*60}")
     print(f"  Ciclo Concluído")

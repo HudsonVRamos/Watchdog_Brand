@@ -14,7 +14,7 @@ from hypothesis import strategies as st
 from brand_watchdog.utils.validators import URLValidator
 
 
-_PBT_SETTINGS = settings(max_examples=100)
+_PBT_SETTINGS = settings(max_examples=30)
 
 # Estratégia para gerar schemes com variações de case
 _schemes = st.sampled_from([

@@ -14,7 +14,7 @@ import logging
 import signal
 from pathlib import Path
 
-from brand_watchdog.config import AppConfig, load_config
+from brand_watchdog.config import load_config
 
 logger = logging.getLogger(__name__)
 
@@ -52,22 +52,6 @@ def _resolve_config_path() -> Path | None:
     return None
 
 
-def _create_email_provider(config: AppConfig):
-    """Cria o EmailProvider adequado com base na configuração.
-
-    Returns:
-        Instância de SESProvider ou SMTPProvider.
-    """
-    from brand_watchdog.alerts.email_providers import (
-        SESProvider,
-        SMTPProvider,
-    )
-
-    if config.alert.provider == "smtp":
-        return SMTPProvider(config.alert)
-    return SESProvider(config.alert)
-
-
 async def main() -> None:
     """Inicializa e executa o Brand Watchdog.
 
@@ -96,63 +80,63 @@ async def main() -> None:
     logger.info("Banco de dados inicializado")
 
     # 3. Instanciar componentes com injeção de dependências
-    from brand_watchdog.alerts.compliance_email_notifier import (
-        ComplianceEmailNotifier,
-    )
-    from brand_watchdog.analyzer.bedrock_client import BedrockClient
-    from brand_watchdog.analyzer.compliance_analyzer import (
-        ComplianceAnalyzer,
-    )
     from brand_watchdog.coordinator.coordinator import (
         MonitoringCoordinator,
     )
-    from brand_watchdog.crawler.crawler import Crawler
+    from brand_watchdog.coordinator.cycle_consolidator import (
+        CycleConsolidator,
+    )
+    from brand_watchdog.queue.publisher import SQSPublisher
     from brand_watchdog.registry.target_site_manager import (
         TargetSiteManager,
     )
     from brand_watchdog.scheduler.scheduler import MonitoringScheduler
-    from brand_watchdog.storage.detection_store import DetectionStore
-    from brand_watchdog.storage.screenshot_store import ScreenshotStore
-
-    # Crawler
-    crawler = Crawler(
-        config=config.crawler,
-        storage_config=config.storage,
+    from brand_watchdog.utils.rule_set_version import (
+        RuleSetVersionCalculator,
     )
-
-    # ComplianceAnalyzer + BedrockClient
-    bedrock_client = BedrockClient(config=config.analyzer)
-    detection_store = DetectionStore(config=config.storage)
-    compliance_analyzer = ComplianceAnalyzer(
-        config=config.analyzer,
-        bedrock_client=bedrock_client,
-        detection_store=detection_store,
-        storage_config=config.storage,
-        brand=config.brand,
-    )
-
-    # Stores
-    screenshot_store = ScreenshotStore(config=config.storage)
 
     # Target Site Manager
     target_site_manager = TargetSiteManager(
         max_target_sites=config.max_target_sites,
     )
 
-    # Compliance Email Notifier
-    email_provider = _create_email_provider(config)
-    compliance_notifier = ComplianceEmailNotifier(
+    # Monitoring Coordinator (distribuído)
+    rules_dir = Path("watchdog_rules")
+    rule_set_calculator = RuleSetVersionCalculator(
+        rules_dir=rules_dir,
+    )
+    sqs_publisher = SQSPublisher(
+        queue_url=config.queue.queue_url,
+        region=config.storage.s3_region,
+    )
+
+    # Email Notifier para relatório consolidado do ciclo
+    from brand_watchdog.alerts.compliance_email_notifier import (
+        ComplianceEmailNotifier,
+    )
+    from brand_watchdog.alerts.email_providers import (
+        create_email_provider,
+    )
+
+    email_provider = create_email_provider(config.alert)
+    email_notifier = ComplianceEmailNotifier(
         config=config.alert,
         email_provider=email_provider,
     )
+    recipients = config.alert.recipients
+    if isinstance(recipients, str):
+        recipients = [r.strip() for r in recipients.split(",")]
 
-    # Monitoring Coordinator
+    consolidator = CycleConsolidator(
+        config=config.worker,
+        email_notifier=email_notifier,
+        recipients=recipients,
+    )
+
     coordinator = MonitoringCoordinator(
-        crawler=crawler,
-        compliance_analyzer=compliance_analyzer,
-        compliance_notifier=compliance_notifier,
-        detection_store=detection_store,
-        screenshot_store=screenshot_store,
+        rule_set_calculator=rule_set_calculator,
+        sqs_publisher=sqs_publisher,
+        consolidator=consolidator,
         target_site_manager=target_site_manager,
         config=config,
     )
